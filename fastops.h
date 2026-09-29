@@ -7,6 +7,7 @@
 #ifndef FASTOPS_H
 #define FASTOPS_H
 #include "emu.h"
+#include "vfpops.h"
 
 static inline __attribute__((always_inline))
 void dp_exec(cpu_t *c, const int opc, const int S, u32 a, u32 b, u32 co, u32 rd)
@@ -227,17 +228,17 @@ static inline JITCALL void vstr_d(cpu_t *c, const di_t *d)     { stf64(c->r[d->r
 static inline JITCALL void vmov_rs(cpu_t *c, const di_t *d)    { c->r[d->rd] = c->v.w[d->rn]; }   /* rd = core, rn = s */
 static inline JITCALL void vmov_sr(cpu_t *c, const di_t *d)    { c->v.w[d->rn] = c->r[d->rd]; }
 static inline JITCALL void vmrs_apsr(cpu_t *c, const di_t *d)  { (void)d; c->cpsr = (c->cpsr & 0x0FFFFFFFu) | (c->fpscr & 0xF0000000u); }
-static inline JITCALL void vadd_s(cpu_t *c, const di_t *d)  { c->v.f[d->rd] = c->v.f[d->rn] + c->v.f[d->rm]; }
-static inline JITCALL void vsub_s(cpu_t *c, const di_t *d)  { c->v.f[d->rd] = c->v.f[d->rn] - c->v.f[d->rm]; }
-static inline JITCALL void vmul_s(cpu_t *c, const di_t *d)  { c->v.f[d->rd] = c->v.f[d->rn] * c->v.f[d->rm]; }
-static inline JITCALL void vnmul_s(cpu_t *c, const di_t *d) { c->v.f[d->rd] = -(c->v.f[d->rn] * c->v.f[d->rm]); }
-static inline JITCALL void vmla_s(cpu_t *c, const di_t *d)  { c->v.f[d->rd] = c->v.f[d->rn] * c->v.f[d->rm] + c->v.f[d->rd]; }
-static inline JITCALL void vmls_s(cpu_t *c, const di_t *d)  { c->v.f[d->rd] = c->v.f[d->rd] - c->v.f[d->rn] * c->v.f[d->rm]; }
-static inline JITCALL void vdiv_s(cpu_t *c, const di_t *d)  { c->v.f[d->rd] = c->v.f[d->rn] / c->v.f[d->rm]; }
-static inline JITCALL void vmov_ss(cpu_t *c, const di_t *d) { c->v.f[d->rd] = c->v.f[d->rm]; }
-static inline JITCALL void vneg_s(cpu_t *c, const di_t *d)  { c->v.f[d->rd] = -c->v.f[d->rm]; }
-static inline JITCALL void vabs_s(cpu_t *c, const di_t *d)  { c->v.f[d->rd] = fabsf(c->v.f[d->rm]); }
-static inline JITCALL void vsqrt_s(cpu_t *c, const di_t *d) { c->v.f[d->rd] = sqrtf(c->v.f[d->rm]); }
+static inline JITCALL void vadd_s(cpu_t *c, const di_t *d)  { c->v.w[d->rd] = vfp_op32(c->fpscr, FOP_ADD, c->v.w[d->rn], c->v.w[d->rm]); }
+static inline JITCALL void vsub_s(cpu_t *c, const di_t *d)  { c->v.w[d->rd] = vfp_op32(c->fpscr, FOP_SUB, c->v.w[d->rn], c->v.w[d->rm]); }
+static inline JITCALL void vmul_s(cpu_t *c, const di_t *d)  { c->v.w[d->rd] = vfp_op32(c->fpscr, FOP_MUL, c->v.w[d->rn], c->v.w[d->rm]); }
+static inline JITCALL void vnmul_s(cpu_t *c, const di_t *d) { c->v.w[d->rd] = vfp_neg32(vfp_op32(c->fpscr, FOP_MUL, c->v.w[d->rn], c->v.w[d->rm])); }
+static inline JITCALL void vmla_s(cpu_t *c, const di_t *d)  { u32 f = c->fpscr; c->v.w[d->rd] = vfp_op32(f, FOP_ADD, c->v.w[d->rd], vfp_op32(f, FOP_MUL, c->v.w[d->rn], c->v.w[d->rm])); }
+static inline JITCALL void vmls_s(cpu_t *c, const di_t *d)  { u32 f = c->fpscr; c->v.w[d->rd] = vfp_op32(f, FOP_ADD, c->v.w[d->rd], vfp_neg32(vfp_op32(f, FOP_MUL, c->v.w[d->rn], c->v.w[d->rm]))); }
+static inline JITCALL void vdiv_s(cpu_t *c, const di_t *d)  { c->v.w[d->rd] = vfp_op32(c->fpscr, FOP_DIV, c->v.w[d->rn], c->v.w[d->rm]); }
+static inline JITCALL void vmov_ss(cpu_t *c, const di_t *d) { c->v.w[d->rd] = c->v.w[d->rm]; }
+static inline JITCALL void vneg_s(cpu_t *c, const di_t *d)  { c->v.w[d->rd] = vfp_neg32(c->v.w[d->rm]); }
+static inline JITCALL void vabs_s(cpu_t *c, const di_t *d)  { c->v.w[d->rd] = c->v.w[d->rm] & 0x7FFFFFFFu; }
+static inline JITCALL void vsqrt_s(cpu_t *c, const di_t *d) { c->v.w[d->rd] = vfp_sqrt32(c->fpscr, c->v.w[d->rm]); }
 static inline JITCALL void vmov_imm_s(cpu_t *c, const di_t *d) { c->v.w[d->rd] = d->a; }
 static inline void vcmp_flags(cpu_t *c, f64 a, f64 b)
 {
@@ -248,8 +249,8 @@ static inline void vcmp_flags(cpu_t *c, f64 a, f64 b)
     else                   f = FLAG_C;
     c->fpscr = (c->fpscr & 0x0FFFFFFFu) | f;
 }
-static inline JITCALL void vcmp_s(cpu_t *c, const di_t *d)  { vcmp_flags(c, c->v.f[d->rd], c->v.f[d->rm]); }
-static inline JITCALL void vcmpz_s(cpu_t *c, const di_t *d) { vcmp_flags(c, c->v.f[d->rd], 0.0f); }
+static inline JITCALL void vcmp_s(cpu_t *c, const di_t *d)  { bool z = c->fpscr & FPSCR_FZ; vcmp_flags(c, b2f(z ? ftz32(c->v.w[d->rd]) : c->v.w[d->rd]), b2f(z ? ftz32(c->v.w[d->rm]) : c->v.w[d->rm])); }
+static inline JITCALL void vcmpz_s(cpu_t *c, const di_t *d) { bool z = c->fpscr & FPSCR_FZ; vcmp_flags(c, b2f(z ? ftz32(c->v.w[d->rd]) : c->v.w[d->rd]), 0.0f); }
 static inline JITCALL void vcvt_s_s32(cpu_t *c, const di_t *d) { c->v.f[d->rd] = (f32)(s32)c->v.w[d->rm]; }
 static inline JITCALL void vcvt_s_u32(cpu_t *c, const di_t *d) { c->v.f[d->rd] = (f32)c->v.w[d->rm]; }
 static inline JITCALL void vcvt_s32_s_rz(cpu_t *c, const di_t *d)
@@ -257,8 +258,8 @@ static inline JITCALL void vcvt_s32_s_rz(cpu_t *c, const di_t *d)
     f64 v = c->v.f[d->rm], r = trunc(v);
     c->v.w[d->rd] = isnan(v) ? 0 : r >= 2147483647.0 ? 0x7FFFFFFFu : r <= -2147483648.0 ? 0x80000000u : (u32)(s32)r;
 }
-static inline JITCALL void vcvt_d_s(cpu_t *c, const di_t *d) { c->v.d[d->rd] = (f64)c->v.f[d->rm]; }   /* rd = d-reg */
-static inline JITCALL void vcvt_s_d(cpu_t *c, const di_t *d) { c->v.f[d->rd] = (f32)c->v.d[d->rm]; }   /* rm = d-reg */
+static inline JITCALL void vcvt_d_s(cpu_t *c, const di_t *d) { c->v.q[d->rd] = vfp_cvt_ds(c->fpscr, c->v.w[d->rm]); }   /* rd = d-reg */
+static inline JITCALL void vcvt_s_d(cpu_t *c, const di_t *d) { c->v.w[d->rd] = vfp_cvt_sd(c->fpscr, c->v.q[d->rm]); }   /* rm = d-reg */
 
 /* ---- race-workload additions ---- */
 
@@ -292,8 +293,8 @@ static inline JITCALL void umlal_(cpu_t *c, const di_t *d) { u64 r = (u64)c->r[d
 static inline JITCALL void smlal_(cpu_t *c, const di_t *d) { u64 r = (u64)((s64)(s32)c->r[d->rm] * (s32)c->r[d->b]) + (((u64)c->r[d->rn] << 32) | c->r[d->rd]); c->r[d->rd] = (u32)r; c->r[d->rn] = (u32)(r >> 32); }
 
 static inline JITCALL void ldr_pcreg(cpu_t *c, const di_t *d) { c->r[d->rd] = ld32(d->a + (c->r[d->rm] << d->b)); }  /* ldr rd, [pc, rm, lsl #n] */
-static inline JITCALL void vnmls_s(cpu_t *c, const di_t *d) { c->v.f[d->rd] = c->v.f[d->rn] * c->v.f[d->rm] - c->v.f[d->rd]; }
-static inline JITCALL void vnmla_s(cpu_t *c, const di_t *d) { c->v.f[d->rd] = -(c->v.f[d->rn] * c->v.f[d->rm]) - c->v.f[d->rd]; }
+static inline JITCALL void vnmls_s(cpu_t *c, const di_t *d) { u32 f = c->fpscr; c->v.w[d->rd] = vfp_op32(f, FOP_ADD, vfp_neg32(c->v.w[d->rd]), vfp_op32(f, FOP_MUL, c->v.w[d->rn], c->v.w[d->rm])); }
+static inline JITCALL void vnmla_s(cpu_t *c, const di_t *d) { u32 f = c->fpscr; c->v.w[d->rd] = vfp_op32(f, FOP_ADD, vfp_neg32(c->v.w[d->rd]), vfp_neg32(vfp_op32(f, FOP_MUL, c->v.w[d->rn], c->v.w[d->rm]))); }
 static inline JITCALL void br_blx(cpu_t *c, const di_t *d) { u32 t = c->r[d->rm]; c->r[14] = d->b; cpu_branch(c, t); }
 static inline JITCALL void clz_(cpu_t *c, const di_t *d) { u32 v = c->r[d->rm]; c->r[d->rd] = v ? (u32)__builtin_clz(v) : 32; }
 
@@ -304,6 +305,64 @@ static inline JITCALL void stm_ia(cpu_t *c, const di_t *d)
 { u32 a = c->r[d->rn], l = d->a; while (l) { int i = __builtin_ctz(l); l &= l - 1; st32(a, c->r[i]); a += 4; } }
 static inline JITCALL void stm_ia_wb(cpu_t *c, const di_t *d)
 { u32 a = c->r[d->rn], l = d->a; while (l) { int i = __builtin_ctz(l); l &= l - 1; st32(a, c->r[i]); a += 4; } c->r[d->rn] = a; }
+
+
+/* ---- Thumb-only ops (thumb.c) ---- */
+void arm7_excl_at(cpu_t *c, u32 op, u32 addr, u32 rd, u32 rt);
+/* BranchWritePC in Thumb: stays in Thumb, bit0 ignored */
+static inline JITCALL void t_bwpc(cpu_t *c, const di_t *d)   { u32 t = c->r[d->rm] & ~1u; ring_push(c, t); c->r[15] = t; }
+static inline JITCALL void t_add_pc(cpu_t *c, const di_t *d) { u32 t = (d->a + c->r[d->rm]) & ~1u; ring_push(c, t); c->r[15] = t; }
+/* blx imm (Thumb -> ARM): d->a = ARM target, d->b = return | 1 */
+static inline JITCALL void t_blxi(cpu_t *c, const di_t *d)   { ring_push(c, d->a); c->r[14] = d->b; c->cpsr &= ~FLAG_T; c->r[15] = d->a; }
+static inline JITCALL void t_cbz(cpu_t *c, const di_t *d)    { if (!c->r[d->rn]) c->r[15] = d->a; }
+static inline JITCALL void t_cbnz(cpu_t *c, const di_t *d)   { if (c->r[d->rn]) c->r[15] = d->a; }
+/* table branch: d->a = pc+4 (branch base, also the value of pc as rn), d->b = 1 halfword table */
+static inline JITCALL void t_tbb(cpu_t *c, const di_t *d)
+{
+    u32 base = d->rn == 15 ? d->a : c->r[d->rn];
+    u32 off = d->b ? ld16(base + 2 * c->r[d->rm]) : ld8(base + c->r[d->rm]);
+    u32 t = d->a + 2 * off; ring_push(c, t); c->r[15] = t;
+}
+/* orn: d->b bit0 = S; bit1 = register operand (bits 2.. = shift spec), else d->a = imm, bit2 = imm carry from bit31 */
+static inline JITCALL void t_orn(cpu_t *c, const di_t *d)
+{
+    u32 co = c->cpsr & FLAG_C, op2;
+    if (d->b & 2) op2 = shift_imm(c, c->r[d->rm], d->b >> 3, &co);
+    else { op2 = d->a; if (d->b & 4) co = (d->a >> 31) ? FLAG_C : 0; }
+    u32 r = (d->rn == 15 ? 0 : c->r[d->rn]) | ~op2;
+    c->r[d->rd] = r;
+    if (d->b & 1) c->cpsr = (c->cpsr & 0x1FFFFFFFu) | (r & 0x80000000u) | (r ? 0 : FLAG_Z) | co;
+}
+/* literal loads: d->a = address, d->b = 0 ldrb 1 ldrh 2 ldrsb 3 ldrsh */
+static inline JITCALL void t_ld_lit(cpu_t *c, const di_t *d)
+{
+    switch (d->b) { case 0: c->r[d->rd] = ld8(d->a); break; case 1: c->r[d->rd] = ld16(d->a); break;
+                    case 2: c->r[d->rd] = (u32)(s32)(s8)ld8(d->a); break; default: c->r[d->rd] = (u32)(s32)(s16)ld16(d->a); break; }
+}
+/* ldrd/strd, any register pair: d->rd = rt, d->rm = rt2, d->a = signed offset;
+   d->b = 0 offset, 1 pre-index writeback, 2 post-index, 3 literal (d->a absolute) */
+static inline JITCALL void t_ldrd(cpu_t *c, const di_t *d)
+{
+    u32 base = d->b == 3 ? 0 : c->r[d->rn], ea = d->b == 2 ? base : base + d->a;
+    u32 lo = ld32(ea), hi = ld32(ea + 4);
+    if (d->b == 1 || d->b == 2) c->r[d->rn] = base + d->a;
+    c->r[d->rd] = lo; c->r[d->rm] = hi;
+}
+static inline JITCALL void t_strd(cpu_t *c, const di_t *d)
+{
+    u32 base = c->r[d->rn], ea = d->b == 2 ? base : base + d->a;
+    st32(ea, c->r[d->rd]); st32(ea + 4, c->r[d->rm]);
+    if (d->b == 1 || d->b == 2) c->r[d->rn] = base + d->a;
+}
+/* halfword / signed register offset with LSL #n: d->b = shift | kind << 4 (0 strh 1 ldrh 2 ldrsb 3 ldrsh) */
+static inline JITCALL void t_ls_hreg(cpu_t *c, const di_t *d)
+{
+    u32 ea = c->r[d->rn] + (c->r[d->rm] << (d->b & 3));
+    switch (d->b >> 4) { case 0: st16(ea, (u16)c->r[d->rd]); break; case 1: c->r[d->rd] = ld16(ea); break;
+                         case 2: c->r[d->rd] = (u32)(s32)(s8)ld8(ea); break; default: c->r[d->rd] = (u32)(s32)(s16)ld16(ea); break; }
+}
+/* ldrex/strex with an offset: d->b = ARM op (bits 23-20), d->a = offset, d->rd / d->rm as the ARM fields */
+static inline JITCALL void t_excl(cpu_t *c, const di_t *d) { arm7_excl_at(c, d->b, c->r[d->rn] + d->a, d->rd, d->rm); }
 
 /* X-macro list of every fast op. Order defines the op ids. */
 #define DP_OPS(X, opc) X(dp_##opc##_0i) X(dp_##opc##_1i) X(dp_##opc##_0r) X(dp_##opc##_1r) X(dp_##opc##_0s) X(dp_##opc##_1s)
@@ -330,7 +389,8 @@ static inline JITCALL void stm_ia_wb(cpu_t *c, const di_t *d)
     X(vcvt_s_s32) X(vcvt_s_u32) X(vcvt_s32_s_rz) X(vcvt_d_s) X(vcvt_s_d) \
     X(vldm_s_ia) X(vstm_s_ia) X(vldm_s_db) X(vstm_s_db) X(vldm_d_ia) X(vstm_d_ia) X(vldm_d_db) X(vstm_d_db) \
     X(ldrd_i) X(strd_i) X(ldrd_r) X(strd_r) X(umull_) X(smull_) X(umlal_) X(smlal_) \
-    X(ldr_pcreg) X(vnmls_s) X(vnmla_s) X(br_blx) X(clz_) X(ldm_ia) X(stm_ia) X(stm_ia_wb)
+    X(ldr_pcreg) X(vnmls_s) X(vnmla_s) X(br_blx) X(clz_) X(ldm_ia) X(stm_ia) X(stm_ia_wb) \
+    X(t_bwpc) X(t_add_pc) X(t_blxi) X(t_cbz) X(t_cbnz) X(t_tbb) X(t_orn) X(t_ld_lit) X(t_ldrd) X(t_strd) X(t_ls_hreg) X(t_excl)
 
 enum {
     OP_decode, OP_generic, OP_hook,

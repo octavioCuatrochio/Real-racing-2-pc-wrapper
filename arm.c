@@ -237,10 +237,10 @@ static void op_dsp_mul(cpu_t *c, u32 insn)
         prod = ((s64)(s32)c->r[rm] * b) >> 16;
         if (x) { /* SMULWy */
             c->r[rd] = (u32)(s32)prod;
-        } else {
-            s64 chk = prod + (s32)c->r[rn];
-            c->r[rd] = sat32(chk, &sat);
-            if (sat) c->cpsr |= FLAG_Q;
+        } else {                      /* SMLAWy: wraps, overflow only sets Q */
+            s64 chk = (s64)(s32)(u32)prod + (s32)c->r[rn];
+            c->r[rd] = (u32)chk;
+            if (chk != (s32)chk) c->cpsr |= FLAG_Q;
         }
         break; }
     case 2: { /* SMLALxy */
@@ -329,7 +329,7 @@ static void op_ls(cpu_t *c, u32 insn)
         if (rd == 15) cpu_branch(c, v);
         else c->r[rd] = v;
     } else {
-        u32 v = (rd == 15) ? c->r[15] + 8 : c->r[rd]; /* store of r15 = pc+12 */
+        u32 v = (rd == 15) ? c->r[15] + 4 : c->r[rd]; /* store of r15 = pc+8 (ARMv7) */
         if (B) st8(ea, (u8)v); else st32(ea, v);
     }
 }
@@ -418,7 +418,7 @@ static void op_ldmstm(cpu_t *c, u32 insn)
         u32 wb = U ? base + 4 * n : base - 4 * n;
         for (int i = 0; i < 16; i++)
             if (list & (1 << i)) {
-                u32 v = (i == 15) ? c->r[15] + 8 : c->r[i];  /* r15 stores pc+12 */
+                u32 v = (i == 15) ? c->r[15] + 4 : c->r[i];  /* r15 stores pc+8 (ARMv7) */
                 if (i == (int)rn && (list & ((1 << rn) - 1)))
                     v = c->r[rn];     /* base not lowest in list: UNPREDICTABLE, use old */
                 st32(addr, v);
@@ -452,7 +452,7 @@ static void op_misc(cpu_t *c, u32 insn)
     u32 b2720 = (insn >> 20) & 0xFF, b74 = (insn >> 4) & 0xF;
 
     if (b74 == 0x0 && b2720 == 0x10 && ((insn >> 16) & 0xF) == 0xF) {   /* MRS */
-        c->r[(insn >> 12) & 0xF] = c->cpsr & 0xF8FFFFFFu;
+        c->r[(insn >> 12) & 0xF] = (c->cpsr & 0xF80F0000u) | 0x10;   /* APSR + user mode */
         return;
     }
     if (b74 == 0x0 && (b2720 == 0x12 || b2720 == 0x16)) {               /* MSR reg */
@@ -565,6 +565,14 @@ static void op_svc(cpu_t *c, u32 insn)
 /* classifier                                                          */
 /* ------------------------------------------------------------------ */
 
+void arm7_parallel(cpu_t *c, u32 insn);
+void arm7_pack(cpu_t *c, u32 insn);
+void arm7_smul(cpu_t *c, u32 insn);
+void arm7_bits(cpu_t *c, u32 insn);
+void arm7_movwt(cpu_t *c, u32 insn);
+void arm7_mls_umaal(cpu_t *c, u32 insn);
+void arm7_excl(cpu_t *c, u32 insn);
+
 void cpu_init_decode(void)
 {
     for (u32 key = 0; key < 4096; key++) {
@@ -575,9 +583,11 @@ void cpu_init_decode(void)
         case 0: /* 000: dp / mul / extra-ls / misc */
             if (b74 == 0x9) {
                 if ((b2720 & 0xFC) == 0x00) h = op_mul;
+                else if (b2720 == 0x04 || b2720 == 0x06) h = arm7_mls_umaal;
                 else if ((b2720 & 0xF8) == 0x08) h = op_mullong;
                 else if ((b2720 & 0xF9) == 0x10) h = op_misc;   /* swp vs smlalxy: runtime */
-                else h = op_undef;                       /* ldrex/strex: unsupported */
+                else if ((b2720 & 0xF8) == 0x18) h = arm7_excl; /* ldrex/strex{,b,h,d} */
+                else h = op_undef;
             } else if (b74 == 0xB || b74 == 0xD || b74 == 0xF) {
                 h = op_ls_extra;
             } else if ((b2720 & 0xF9) == 0x10) {
@@ -586,14 +596,19 @@ void cpu_init_decode(void)
                 h = op_dp;
             }
             break;
-        case 1: /* 001: dp immediate / msr imm */
-            h = ((b2720 & 0xFB) == 0x32) ? op_msr_imm : op_dp;
+        case 1: /* 001: dp immediate / msr imm + hints / movw / movt */
+            h = ((b2720 & 0xFB) == 0x32) ? op_msr_imm : (b2720 == 0x30 || b2720 == 0x34) ? arm7_movwt : op_dp;
             break;
         case 2: /* 010: ldr/str immediate (bits 7-4 are offset) */
             h = op_ls;
             break;
-        case 3: /* 011: ldr/str register (bit4=1 is media/undef) */
-            h = (b74 & 1) ? op_undef : op_ls;
+        case 3: /* 011: ldr/str register; bit4=1 is the media space */
+            if (!(b74 & 1)) h = op_ls;
+            else if ((b2720 & 0xF8) == 0x60) h = arm7_parallel;
+            else if ((b2720 & 0xF8) == 0x68) h = arm7_pack;
+            else if ((b2720 & 0xF8) == 0x70) h = arm7_smul;
+            else if ((b2720 & 0xF8) == 0x78 && !(b2720 == 0x7F && b74 == 0xF)) h = arm7_bits;
+            else h = op_undef;
             break;
         case 4: h = op_ldmstm; break;
         case 5: h = op_branch; break;

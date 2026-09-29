@@ -48,7 +48,7 @@ static void *gthread_main(void *p)
 
     c->r[0] = arg;
     c->r[14] = HLE_SLOT_BASE;      /* magic return: start_routine return ends thread */
-    c->r[15] = start;
+    cpu_set_pc(c, start);
     cpu_run(c);
 
     c->thread_ret = c->r[0];
@@ -519,7 +519,7 @@ static void hle_longjmp(cpu_t *c)
         c->v.q[8 + i] = (u64)ld32(jb + 4 * (16 + 2 * i)) |
                         ((u64)ld32(jb + 4 * (17 + 2 * i)) << 32);
     c->r[0] = val ? val : 1;
-    c->r[15] = c->r[14];   /* resume at the setjmp call's return address */
+    cpu_set_pc(c, c->r[14]);   /* resume at the setjmp call's return address */
 }
 
 /* ================================================================== */

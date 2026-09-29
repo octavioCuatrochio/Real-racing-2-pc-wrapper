@@ -3,6 +3,7 @@
  */
 #include "fastops.h"
 #include <stdarg.h>
+#include <setjmp.h>
 
 handler_t dec_table[4096];
 
@@ -12,16 +13,23 @@ extern bool hle_divert(cpu_t *c, u32 pc);
 void cpu_branch(cpu_t *c, u32 addr)
 {
     c->ring[c->ring_pos = (c->ring_pos + 1) & 63] = addr;
-    if (addr & 1)
-        emu_trap(c, "branch to %08x: Thumb state not supported", addr);
-    if (addr & 2)
-        LOG_ONCE("[cpu] warning: branch to halfword-aligned %08x\n", addr);
-    c->r[15] = addr;
+    if ((addr & 3) == 2)
+        LOG_ONCE("[cpu] warning: ARM branch to halfword-aligned %08x\n", addr);
+    cpu_set_pc(c, addr);
 }
+
+jmp_buf *g_trap_jmp;              /* difftest: traps return here instead of aborting */
+char g_trap_msg[256];
 
 [[noreturn]] void emu_trap(cpu_t *c, const char *fmt, ...)
 {
     va_list ap;
+    if (g_trap_jmp) {
+        va_start(ap, fmt);
+        vsnprintf(g_trap_msg, sizeof(g_trap_msg), fmt, ap);
+        va_end(ap);
+        longjmp(*g_trap_jmp, 1);
+    }
     va_start(ap, fmt);
     fprintf(stderr, "\n*** cpu trap (tid %d): ", c ? c->tid : -1);
     vfprintf(stderr, fmt, ap);
@@ -75,13 +83,16 @@ static void cpu_run_trace(cpu_t *c)
             if (run_slow(c, pc)) return;
             continue;
         }
-        u32 insn = ld32(pc);
-        c->r[15] = pc + 4;
-        if (cond_ok(insn >> 28, c->cpsr))
-            dec_table[DEC_KEY(insn)](c, insn);
+        di_t d;
+        bool thumb = c->cpsr & FLAG_T;
+        cpu_decode_at(&d, pc, thumb);
+        c->r[15] = pc + d.len;
+        if (d.cond == 0xE || d.cond == 0xF || ((cond_tab[d.cond] >> (c->cpsr >> 28)) & 1))
+            d.h(c, &d);
         c->insn_count++;
-        LOG("[trace] %08x: %08x  r0=%08x r1=%08x r2=%08x r3=%08x sp=%08x lr=%08x\n",
-            pc, insn, c->r[0], c->r[1], c->r[2], c->r[3], c->r[13], c->r[14]);
+        LOG("[trace] %08x%s: %08x  r0=%08x r1=%08x r2=%08x r3=%08x r4=%08x sp=%08x lr=%08x cpsr=%08x\n",
+            pc, thumb ? "T" : " ", d.len == 2 ? (u32)ld16(pc) : thumb ? ((u32)ld16(pc) << 16 | ld16(pc + 2)) : ld32(pc),
+            c->r[0], c->r[1], c->r[2], c->r[3], c->r[4], c->r[13], c->r[14], c->cpsr);
     }
 }
 
@@ -103,7 +114,7 @@ void cpu_run(cpu_t *c)
     };
     tls_cpu = c;
     if (__builtin_expect(g_verbose >= 3, 0)) { cpu_run_trace(c); return; }
-    if (g_jit) {
+    if (g_jit && !(c->cpsr & FLAG_T)) {
         c->span = G.text_span;
         if (jit_run(c, run_slow)) return;
     }
@@ -116,8 +127,8 @@ void cpu_run(cpu_t *c)
 #define DISPATCH() do {                                                        \
         pc = c->r[15];                                                         \
         if (__builtin_expect(pc - lo >= c->span, 0)) goto slow;                \
-        d = &cache[(pc - lo) >> 2];                                            \
-        c->r[15] = pc + 4;                                                     \
+        d = &cache[(pc - lo) >> 1];                                            \
+        c->r[15] = pc + d->len;                                                \
         c->insn_count++;                                                       \
         if (d->cx && !((condx_tab[d->cx] >> (c->cpsr >> 28)) & 1))             \
             goto skip;                                                         \
@@ -163,8 +174,7 @@ u32 emu_call(cpu_t *c, u32 fn, int argc, const u32 *args)
 
     c->r[13] = sp;
     c->r[14] = HLE_SLOT_BASE;      /* magic return slot */
-    if (fn & 1) fatal("emu_call to thumb fn %08x", fn);
-    c->r[15] = fn;
+    cpu_set_pc(c, fn);             /* bit0: Thumb entry */
 
     cpu_run(c);                    /* returns when magic-return fires */
 

@@ -20,7 +20,7 @@
 typedef void (JITCALL *jit_entry_t)(cpu_t *c, u8 *mem, void *code);
 
 static u8  *jc_base, *jc_ptr, *jc_end;
-static void **jit_table;                 /* per text word: block code or NULL */
+static void **jit_table;                 /* per text halfword: block code or NULL */
 static u32   jt_lo, jt_words;
 static jit_entry_t jit_enter;
 static u8   *jit_exit_stub;              /* rax = link slot (or 0) */
@@ -225,11 +225,11 @@ static void emit_exit_indirect(void)
     e8(0xA8); e8(3);                            /* test al, 3: misaligned/thumb -> C side traps */
     u8 *miss1 = jcc32(CC_NE);
     alu_ri(5, RAX, jt_lo);
-    alu_ri(7, RAX, jt_words * 4);
+    alu_ri(7, RAX, jt_words * 2);
     u8 *miss2 = jcc32(CC_AE);
     mov_ri64(RDX, (u64)(uintptr_t)jit_table);
-    /* mov rcx, [rdx + rax*2]  (rax = byte offset; table has 8-byte entries per 4-byte word) */
-    e8(0x48); e8(0x8B); e8(0x0C); e8(0x42);
+    /* mov rcx, [rdx + rax*4]  (rax = byte offset; table has 8-byte entries per 2-byte slot) */
+    e8(0x48); e8(0x8B); e8(0x0C); e8(0x82);
     e8(0x48); e8(0x85); e8(0xC9);               /* test rcx, rcx */
     u8 *miss3 = jcc32(CC_E);
     e8(0xFF); e8(0xE1);                         /* jmp rcx */
@@ -355,7 +355,7 @@ static bool emit_vldm(u32 insn)
     bool dbl = ((insn >> 8) & 0xF) == 11;
     if (P == U || rn == 15 || !imm8) return false;
     u32 first = dbl ? (D << 4) | vd : (vd << 1) | D, n = dbl ? imm8 / 2 : imm8;
-    if (!n || (dbl ? first + n > 16 : first + n > 32)) return false;
+    if (!n || first + n > 32) return false;
     ld_r(RCX, OFF_R(rn));
     if (P) alu_ri(5, RCX, imm8 * 4);            /* DB: start below the base */
     for (u32 i = 0; i < n; i++) {
@@ -367,6 +367,21 @@ static bool emit_vldm(u32 insn)
     return true;
 }
 
+/* float guards: DN/FZ mode or a NaN result -> the handler computes ARM semantics */
+static u8 *emit_fp_mode_check(void)
+{
+    rex(0, 0, 0, RBX, false); e8(0xF7); e8(0x83); e32((u32)OFF_FPSCR); e32(0x03000000u);   /* test [rbx+fpscr], DN|FZ */
+    return jcc32(CC_NE);
+}
+static u8 *emit_nan_check(int x) { ucomiss_rr(x, x); return jcc32(0xA); }                    /* jp: unordered */
+static void emit_fp_slow(u8 *a, u8 *b, u8 *done_jmp, u32 pc, u32 insn)
+{
+    patch32(a, p); if (b) patch32(b, p);
+    di_t d; cpu_decode_one(&d, pc, insn);
+    emit_call_handler(NULL, pc, &d);
+    patch32(done_jmp, p);
+}
+
 /* VFP extension group (op 7) + vnmla/vnmls. returns false for anything unusual */
 static bool emit_vfp_ext(u32 insn, u32 pc, const di_t *fallback_d)
 {
@@ -376,15 +391,20 @@ static bool emit_vfp_ext(u32 insn, u32 pc, const di_t *fallback_d)
     u32 sd = (vd << 1) | D, sn = (vn << 1) | N, sm = (vm << 1) | M;
     u32 vop = (((insn >> 23) & 1) << 2) | ((insn >> 20) & 3), b76 = (N << 1) | L;
     if (vop == 1) {                              /* vnmls: n*m - d ; vnmla: -(n*m) - d */
+        u8 *slow1 = emit_fp_mode_check();
         sse_ss(0x10, 0, OFF_S(sn)); sse_ss(0x59, 0, OFF_S(sm));
         if (L) { movd_r_x(RAX, 0); alu_ri(6, RAX, 0x80000000u); movd_x_r(0, RAX); }
         sse_ss(0x5C, 0, OFF_S(sd));
+        u8 *slow2 = emit_nan_check(0);
         sse_st(0, OFF_S(sd));
+        u8 *done = jmp32();
+        emit_fp_slow(slow1, slow2, done, pc, insn);
         return true;
     }
-    if (vop != 7 || b76 == 0) return false;
+    if (vop != 7 || !(b76 & 1)) return false;
     switch (vn) {
     case 0x4: case 0x5: {                        /* vcmp(e) / vcmp(e) #0 -> FPSCR NZCV */
+        u8 *slow1 = emit_fp_mode_check();
         sse_ss(0x10, 0, OFF_S(sd));
         if (vn == 4) sse_ss(0x10, 1, OFF_S(sm)); else xorps_rr(1, 1);
         ucomiss_rr(0, 1);
@@ -398,6 +418,8 @@ static bool emit_vfp_ext(u32 insn, u32 pc, const di_t *fallback_d)
         rex(0, 0, 0, RDX, false); e8(0xD3); e8(0xE8 | (RDX & 7));   /* shr edx, cl */
         alu_ri(4, RDX, 0xF); sh_ri(4, RDX, 28);
         ld_r(RAX, OFF_FPSCR); alu_ri(4, RAX, 0x0FFFFFFFu); alu_rr(1, RAX, RDX); st_r(RAX, OFF_FPSCR);
+        u8 *done = jmp32();
+        emit_fp_slow(slow1, NULL, done, pc, insn);
         return true; }
     case 0x8:                                    /* vcvt.f32.{s32,u32} */
         ld_r(RAX, OFF_S(sm));
@@ -547,7 +569,6 @@ static bool emit_vfp(u32 insn, u32 pc)
         u32 P = (insn >> 24) & 1, U = (insn >> 23) & 1, W = (insn >> 21) & 1, L = (insn >> 20) & 1;
         if (!P || W) return false;
         u32 off = (insn & 0xFF) * 4, rn = vn;
-        if (cp == 11 && dd >= 16) return false;
         get_reg(RCX, rn, pc);
         if (off) alu_ri(U ? 0 : 5, RCX, off);
         if (cp == 10) {
@@ -577,21 +598,23 @@ static bool emit_vfp(u32 insn, u32 pc)
     }
     if (cp != 10) return false;
     u32 vop = (((insn >> 23) & 1) << 2) | ((insn >> 20) & 3), L = (insn >> 6) & 1;
+    if (vop == 1 || vop > 4 || (vop == 4 && L)) return false;
+    u8 *slow1 = emit_fp_mode_check();
     switch (vop) {
     case 3: sse_ss(0x10, 0, OFF_S(sn)); sse_ss(L ? 0x5C : 0x58, 0, OFF_S(sm)); break;   /* vsub/vadd */
-    case 2: sse_ss(0x10, 0, OFF_S(sn)); sse_ss(0x59, 0, OFF_S(sm));                     /* vmul/vnmul */
-            if (L) { e8(0x66); e8(0x0F); e8(0x7E); e8(0xC0); alu_ri(6, RAX, 0x80000000u);  /* movd eax,xmm0 */
-                     st_r(RAX, OFF_S(sd)); return true; }
-            break;
-    case 4: if (L) return false; sse_ss(0x10, 0, OFF_S(sn)); sse_ss(0x5E, 0, OFF_S(sm)); break; /* vdiv */
-    case 0:                                                                             /* vmla/vmls */
+    case 2: sse_ss(0x10, 0, OFF_S(sn)); sse_ss(0x59, 0, OFF_S(sm)); break;              /* vmul/vnmul */
+    case 4: sse_ss(0x10, 0, OFF_S(sn)); sse_ss(0x5E, 0, OFF_S(sm)); break;              /* vdiv */
+    default:                                                                            /* vmla/vmls */
         sse_ss(0x10, 0, OFF_S(sn)); sse_ss(0x59, 0, OFF_S(sm));
         if (!L) sse_ss(0x58, 0, OFF_S(sd));
-        else { sse_ss(0x10, 1, OFF_S(sd)); sse_rr(0x5C, 1, 0); sse_st(1, OFF_S(sd)); return true; }
+        else { sse_ss(0x10, 1, OFF_S(sd)); sse_rr(0x5C, 1, 0); sse_rr(0x10, 0, 1); }
         break;
-    default: return false;
     }
-    sse_st(0, OFF_S(sd));
+    u8 *slow2 = emit_nan_check(0);
+    if (vop == 2 && L) { movd_r_x(RAX, 0); alu_ri(6, RAX, 0x80000000u); st_r(RAX, OFF_S(sd)); }
+    else sse_st(0, OFF_S(sd));
+    u8 *done = jmp32();
+    emit_fp_slow(slow1, slow2, done, pc, insn);
     return true;
 }
 
@@ -917,7 +940,7 @@ void jit_reset(void)
     if (!g_jit || !jit_init()) { g_jit = 0; return; }
     if (jit_table) munmap(jit_table, (size_t)jt_words * sizeof(void *));
     jt_lo = G.text_lo;
-    jt_words = G.text_span / 4;
+    jt_words = G.text_span / 2;
     jit_table = mmap(NULL, (size_t)jt_words * sizeof(void *), PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     jc_ptr = (u8 *)(((uintptr_t)jit_exit_stub + 64) & ~(uintptr_t)15);
@@ -965,10 +988,10 @@ static void emit_slow_indirect_stub(void)
     e8(0xA8); e8(3);
     u8 *m1 = jcc32(CC_NE);
     alu_ri(5, RAX, jt_lo);
-    alu_ri(7, RAX, jt_words * 4);
+    alu_ri(7, RAX, jt_words * 2);
     u8 *again = jcc32(CC_AE);                   /* e.g. HLE tail-called into another HLE slot */
     mov_ri64(RDX, (u64)(uintptr_t)jit_table);
-    e8(0x48); e8(0x8B); e8(0x0C); e8(0x42);     /* mov rcx, [rdx + rax*2] */
+    e8(0x48); e8(0x8B); e8(0x0C); e8(0x82);     /* mov rcx, [rdx + rax*4] */
     e8(0x48); e8(0x85); e8(0xC9);
     u8 *m2 = jcc32(CC_E);
     e8(0xFF); e8(0xE1);                         /* jmp rcx */
@@ -982,7 +1005,7 @@ static void emit_slow_indirect_stub(void)
 
 static void *block_for(u32 pc)
 {
-    u32 i = (pc - jt_lo) >> 2;
+    u32 i = (pc - jt_lo) >> 1;
     void *b = __atomic_load_n(&jit_table[i], __ATOMIC_ACQUIRE);
     if (b) return b;
     pthread_mutex_lock(&jit_lock);
@@ -1002,9 +1025,11 @@ bool jit_run(cpu_t *c, bool (*slow)(cpu_t *, u32))
     if (!g_jit || !jit_table) return false;
     for (;;) {
         u32 pc = c->r[15];
-        if (__builtin_expect(pc & 3, 0) && pc - jt_lo < jt_words * 4)
-            emu_trap(c, "branch to %08x: Thumb/misaligned target", pc);
-        if (pc - jt_lo >= jt_words * 4 || (pc & 3) || c->exit_loop) {
+        if (__builtin_expect(pc & 1, 0)) { cpu_set_pc(c, pc); pc = c->r[15]; }   /* raw bx target from JIT code */
+        if (c->cpsr & FLAG_T) return false;     /* Thumb: the interpreter runs it */
+        if (__builtin_expect(pc & 3, 0) && pc - jt_lo < jt_words * 2)
+            emu_trap(c, "ARM branch to misaligned %08x", pc);
+        if (pc - jt_lo >= jt_words * 2 || (pc & 3) || c->exit_loop) {
             if (slow(c, pc)) return true;
             continue;
         }
@@ -1015,7 +1040,7 @@ bool jit_run(cpu_t *c, bool (*slow)(cpu_t *, u32))
         /* link the exit we left through to its (now compiled) target */
         void **slot = c->jit_link;
         u32 t = c->r[15];
-        if (slot && t - jt_lo < jt_words * 4 && !(t & 3) && !c->exit_loop) {
+        if (slot && t - jt_lo < jt_words * 2 && !(t & 3) && !(c->cpsr & FLAG_T) && !c->exit_loop) {
             void *nb = block_for(t);
             if (nb) __atomic_store_n(slot, nb, __ATOMIC_RELEASE);
         }

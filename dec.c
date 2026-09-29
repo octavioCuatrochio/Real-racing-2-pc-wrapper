@@ -18,6 +18,7 @@ u16 cond_tab[16];
 u16 condx_tab[16];
 
 JITCALL void d_decode(cpu_t *c, const di_t *d);
+void arm7_uncond(cpu_t *c, u32 insn);
 
 static const dfn_t op_fns[OP_COUNT] = {
     [OP_decode] = d_decode, [OP_generic] = NULL, [OP_hook] = NULL,   /* set in decode_into */
@@ -30,7 +31,7 @@ void cpu_icache_reset(void)
 {
     if (g_icache) munmap(g_icache, (size_t)icache_words * sizeof(di_t));
     icache_lo = G.text_lo;
-    icache_words = G.text_span / 4;
+    icache_words = G.text_span / 2;              /* one slot per halfword (Thumb); ARM uses every other */
     /* zero-filled and never pre-touched: op 0 = OP_decode, cx 0 = always */
     g_icache = mmap(NULL, (size_t)icache_words * sizeof(di_t), PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
@@ -59,7 +60,8 @@ JITCALL void d_generic(cpu_t *c, const di_t *d)
         generic_hits[k]++;
         generic_example[k] = d->insn;
     }
-    dec_table[DEC_KEY(d->insn)](c, d->insn);
+    if (__builtin_expect((d->insn >> 28) == 0xF, 0)) arm7_uncond(c, d->insn);
+    else dec_table[DEC_KEY(d->insn)](c, d->insn);
 }
 
 void stats_dump(void)
@@ -93,7 +95,7 @@ void cpu_add_hook(u32 pc) { if (nhooks < 8) hook_pcs[nhooks++] = pc; }
 
 JITCALL void d_hook(cpu_t *c, const di_t *d)
 {
-    u32 pc = c->r[15] - 4;
+    u32 pc = c->r[15] - d->len;
     LOG("[hook] %08x:", pc);
     for (int i = 0; i < 16; i++) LOG(" r%d=%08x", i, i == 15 ? pc : c->r[i]);
     const char *arm = getenv("RR2_HOOK_ARM");             /* "R:A+B": arm a read (R) / write (W) watch */
@@ -124,7 +126,9 @@ JITCALL void d_hook(cpu_t *c, const di_t *d)
         for (int i = 0; i < 8; i++) LOG(" %08x", ld32(at + 4 * i));
     }
     LOG("\n");
-    dec_table[DEC_KEY(d->insn)](c, d->insn);          /* then run the instruction itself */
+    if (d->b0op) op_fns[d->b0op](c, d);                   /* then run the instruction itself */
+    else if ((d->insn >> 28) == 0xF) arm7_uncond(c, d->insn);
+    else dec_table[DEC_KEY(d->insn)](c, d->insn);
 }
 
 static void decode_into(di_t *d, u32 pc, u32 insn)
@@ -331,14 +335,13 @@ static void decode_into(di_t *d, u32 pc, u32 insn)
                 if (P == U) goto done;                                      /* not a valid multiple */
                 if (d->rn == 15 || !imm8) goto done;
                 if (cp == 10) { if (sd + imm8 > 32) goto done; d->rd = (u8)sd; d->a = imm8; }
-                else { if (dd + imm8 / 2 > 16 || !(imm8 / 2)) goto done; d->rd = (u8)dd; d->a = imm8 / 2; }
+                else { if (dd + imm8 / 2 > 32 || !(imm8 / 2)) goto done; d->rd = (u8)dd; d->a = imm8 / 2; }
                 d->b = W | (imm8 << 8);
                 if (P) op = cp == 10 ? (L ? OP_vldm_s_db : OP_vstm_s_db) : (L ? OP_vldm_d_db : OP_vstm_d_db);
                 else   op = cp == 10 ? (L ? OP_vldm_s_ia : OP_vstm_s_ia) : (L ? OP_vldm_d_ia : OP_vstm_d_ia);
                 goto done;
             }
             u32 off = (insn & 0xFF) * 4, so = U ? off : (u32)-off;
-            if (cp == 11 && dd >= 16) goto done;
             d->rd = (u8)(cp == 10 ? sd : dd);
             if (d->rn == 15) {
                 if (!L) goto done;
@@ -374,13 +377,14 @@ static void decode_into(di_t *d, u32 pc, u32 insn)
         }
         u32 b76 = (N << 1) | L;
         if (cp == 11) {
-            if (vn == 7 && b76 && dm < 16) { d->rd = (u8)sd; d->rm = (u8)dm; op = OP_vcvt_s_d; }
+            if (vn == 7 && b76 == 3) { d->rd = (u8)sd; d->rm = (u8)dm; op = OP_vcvt_s_d; }
             goto done;
         }
         d->rd = (u8)sd; d->rm = (u8)sm;
-        if (b76 == 0) {                              /* vmov.f32 imm */
+        if (!(b76 & 1)) {                           /* vmov.f32 imm */
             u32 imm8 = (vn << 4) | vm;
-            d->a = ((imm8 >> 7) & 1) << 31 | ((((imm8 >> 3) & 0xF) + 120) << 23) | ((imm8 & 7) << 20);
+            extern u32 vfp_imm_bits32(u32 imm8);
+            d->a = vfp_imm_bits32(imm8);
             op = OP_vmov_imm_s;
             goto done;
         }
@@ -389,7 +393,7 @@ static void decode_into(di_t *d, u32 pc, u32 insn)
         case 0x1: op = b76 == 1 ? OP_vneg_s : b76 == 3 ? OP_vsqrt_s : OP_generic; break;
         case 0x4: op = OP_vcmp_s; break;
         case 0x5: op = OP_vcmpz_s; break;
-        case 0x7: if (dd < 16) { d->rd = (u8)dd; op = OP_vcvt_d_s; } break;
+        case 0x7: if (b76 == 3) { d->rd = (u8)dd; op = OP_vcvt_d_s; } break;
         case 0x8: op = (b76 & 2) ? OP_vcvt_s_s32 : OP_vcvt_s_u32; break;
         case 0xD: if (b76 & 2) op = OP_vcvt_s32_s_rz; break;
         default: break;
@@ -403,26 +407,49 @@ done:
         d->b = pc + 4;                               /* blx rm */
         op = OP_br_blx;
     }
+    d->b0op = 0;
     for (int i = 0; i < nhooks; i++)
-        if (hook_pcs[i] == pc) op = OP_hook;
+        if (hook_pcs[i] == pc) { if (op != OP_generic) d->b0op = (u16)op; op = OP_hook; }
+    d->op = (u16)op;
+    d->cx = d->cond ^ 0xE;
+    d->len = 4;
+    d->h = op == OP_generic ? d_generic : op == OP_hook ? d_hook : op_fns[op];
+}
+
+/* shared with thumb.c: finish a di_t whose op was chosen by the Thumb decoder */
+void dec_finish(di_t *d, u32 pc, int op)
+{
+    d->b0op = 0;
+    for (int i = 0; i < nhooks; i++)
+        if (hook_pcs[i] == pc) { if (op != OP_generic) d->b0op = (u16)op; op = OP_hook; }
     d->op = (u16)op;
     d->cx = d->cond ^ 0xE;
     d->h = op == OP_generic ? d_generic : op == OP_hook ? d_hook : op_fns[op];
 }
 
+/* ARM encoding -> di_t, for the Thumb decoder's translated instructions */
+void dec_arm(di_t *d, u32 pc, u32 insn) { decode_into(d, pc, insn); }
+
+void cpu_decode_at(di_t *out, u32 pc, bool thumb)
+{
+    if (thumb) thumb_decode(out, pc);
+    else decode_into(out, pc, ld32(pc));
+}
+
 JITCALL void d_decode(cpu_t *c, const di_t *d)
 {
     di_t *w = (di_t *)d;
-    u32 pc = c->r[15] - 4;
+    u32 pc = icache_lo + (u32)(d - g_icache) * 2;
     di_t tmp;
-    decode_into(&tmp, pc, ld32(pc));
+    cpu_decode_at(&tmp, pc, c->cpsr & FLAG_T);
+    c->r[15] = pc + tmp.len;
     dfn_t h = tmp.h;
     u16 op = tmp.op;
     tmp.h = d_decode;
     tmp.op = OP_decode;
     u8 cx = tmp.cx;
     tmp.cx = 0;                      /* published entry keeps "always, decode" until op lands */
-    *w = tmp;                        /* publish operands before the handler */
+    *w = tmp;                        /* publish operands (and len) before the handler */
     __atomic_store_n(&w->h, h, __ATOMIC_RELEASE);
     __atomic_store_n(&w->cx, cx, __ATOMIC_RELAXED);
     __atomic_store_n(&w->op, op, __ATOMIC_RELEASE);

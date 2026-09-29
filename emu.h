@@ -84,9 +84,11 @@ typedef struct emu emu_t;
 
 typedef struct cpu {
     u32 r[16];          /* r[13]=sp r[14]=lr r[15]=pc (pre-incremented by dispatcher) */
-    u32 cpsr;           /* NZCV in bits 31-28, Q in 27; user mode hardwired */
-    union { u32 w[32]; f32 f[32]; f64 d[16]; u64 q[16]; } v;  /* VFP: d<n> aliases s<2n>,s<2n+1> */
-    u32 fpscr;          /* NZCV[31:28] + rounding mode */
+    u32 cpsr;           /* NZCV 31-28, Q 27, GE 19-16, T 5; user mode hardwired */
+    /* VFP/NEON: d<n> aliases s<2n>,s<2n+1>; q<n> = d<2n>,d<2n+1>. q[] is a D register as u64 */
+    union { u32 w[64]; f32 f[64]; f64 d[32]; u64 q[32]; u16 h[128]; u8 b[256]; } v;
+    u32 fpscr;          /* NZCV 31-28, QC 27, DN 25, FZ 24, RMode 23-22 */
+    u32 excl_addr;      /* ldrex/strex monitor: address, or ~0 when clear */
 
     int   tid;
     char  name[16];
@@ -119,6 +121,8 @@ typedef struct cpu {
 #define FLAG_C 0x20000000u
 #define FLAG_V 0x10000000u
 #define FLAG_Q 0x08000000u
+#define FLAG_T 0x00000020u   /* Thumb state */
+#define FLAG_GE 0x000F0000u
 
 static inline bool cond_ok(u32 cond, u32 cpsr)
 {
@@ -156,6 +160,8 @@ struct di {
     u8    cond, rd, rn, rm;
     u16   op;            /* fastops.h op id: computed-goto dispatch index (0 = decode) */
     u8    cx;            /* cond ^ 0xE: 0 = always, so an untouched zero page is "decode me" */
+    u8    len;           /* 4 ARM / Thumb-2 wide, 2 Thumb narrow; 0 = not decoded yet */
+    u16   b0op;          /* OP_hook: the fast op the hooked instruction would have used (0 = generic) */
 };
 extern di_t *g_icache;
 extern u16 cond_tab[16];
@@ -170,6 +176,9 @@ bool jit_test_pair(cpu_t *c, u32 pc, u32 i1, u32 i2);
 u32  jit_guest_pc_of(const void *host);
 bool jit_owns(const void *host);                       /* debug: log registers when pc executes */                     /* after text range changes / code rewritten */
 bool cpu_decode_one(di_t *out, u32 pc, u32 insn);
+void cpu_decode_at(di_t *out, u32 pc, bool thumb);   /* decode guest code at pc (ARM or Thumb) */
+void thumb_decode(di_t *d, u32 pc);                   /* thumb.c */
+void thumb_it_reset(void);
 
 #define EXIT_WATCH 0x100   /* exit_loop bit: re-arm the write watchpoint, keep running */
 void watch_rearm(cpu_t *c);
@@ -180,8 +189,13 @@ void cpu_run(cpu_t *c);
 /* call a guest function from host; reentrant. args r0..r3 order, rest spilled. */
 u32 emu_call(cpu_t *c, u32 fn, int argc, const u32 *args);
 
-/* branch with interwork check; bit0 set => Thumb => fatal */
+/* interworking branch (BX / LoadWritePC / ARM ALUWritePC): bit0 selects Thumb */
 void cpu_branch(cpu_t *c, u32 addr);
+static inline void cpu_set_pc(cpu_t *c, u32 addr)
+{
+    if (addr & 1) { c->cpsr |= FLAG_T; addr &= ~1u; } else c->cpsr &= ~FLAG_T;
+    c->r[15] = addr;
+}
 
 [[noreturn]] void emu_trap(cpu_t *c, const char *fmt, ...);
 

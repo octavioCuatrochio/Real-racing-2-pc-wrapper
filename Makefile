@@ -5,7 +5,7 @@ LDLIBS   = -lpthread -lm -ldl -rdynamic
 # release builds: no -march=native, so they run on any x86-64 CPU (the JIT only emits baseline SSE2)
 RELEASE_CFLAGS = -O2 -D_GNU_SOURCE -std=c11 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -fno-strict-aliasing
 
-SRCS = main.c mem.c cpu.c arm.c dec.c jit.c vfp.c elf.c hle.c hle_libc.c hle_malloc.c hle_sync.c jni.c gles.c glhost.c host.c patches.c launcher.c inflate.c win32.c test.c
+SRCS = main.c mem.c cpu.c arm.c arm7.c dec.c thumb.c neon.c jit.c vfp.c elf.c hle.c hle_libc.c hle_malloc.c hle_sync.c jni.c gles.c glhost.c host.c patches.c launcher.c inflate.c win32.c test.c difftest.c
 OBJS = $(SRCS:.c=.o)
 
 rr2emu: $(OBJS)

@@ -82,6 +82,6 @@ bool hle_divert(cpu_t *c, u32 pc)
     VLOG(2, "[call] %s(%08x, %08x, %08x, %08x) from %08x\n", hle_names[idx],
          c->r[0], c->r[1], c->r[2], c->r[3], c->r[14] - 4);
     hle_fns[idx](c);
-    c->r[15] = c->r[14];   /* return */
+    cpu_set_pc(c, c->r[14]);   /* return (lr bit0: Thumb caller) */
     return false;
 }

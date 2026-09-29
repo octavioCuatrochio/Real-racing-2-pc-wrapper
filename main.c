@@ -183,6 +183,7 @@ void mem_init(void);
 extern int g_stats;
 void stats_dump(void);
 int  selftest_main(void);
+int  difftest_main(int argc, char **argv);
 int  bench_main(void);
 
 static void usage(const char *argv0)
@@ -284,13 +285,14 @@ int main(int argc, char **argv)
     win_init();
 #endif
     const char *so_path = NULL;
-    int do_selftest = 0, do_prof = 0, no_launcher = 0;
+    int do_selftest = 0, do_prof = 0, no_launcher = 0, difft_arg = 0;
     G.assets_dir = "./assets";
     G.apk_assets_dir = "./apk_assets";
     G.max_frames = 0;
     G.width = 800; G.height = 480; G.dpi = 240.0f;
 
     for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--difftest")) { do_selftest = 3; difft_arg = i + 1; break; }
         if (!strcmp(argv[i], "--selftest")) do_selftest = 1;
         else if (!strcmp(argv[i], "--bench")) do_selftest = 2;
         else if (!strcmp(argv[i], "--assets") && i + 1 < argc) G.assets_dir = argv[++i];
@@ -354,6 +356,8 @@ int main(int argc, char **argv)
     cpu_init_decode();
     hle_init();
 
+    if (do_selftest == 3)
+        return difftest_main(argc - difft_arg, argv + difft_arg);
     if (do_selftest)
         return do_selftest == 2 ? bench_main() : selftest_main();
 
