@@ -11,7 +11,6 @@ folder (lib/armeabi + assets/); Game data takes the OBB/cache .zip or a folder h
 com.ea.game.realracing2_*/. Archives are unpacked once to ~/.cache/rr2emu/<kind>-<size>-<mtime>
 (zlib via dlopen). Files can be dropped on the window, typed or pasted (Ctrl+V). Resolution
 (up to the desktop size), fullscreen (native size = borderless desktop, else a mode switch),
-anisotropic filtering (forced on mipmapped textures, overrides the game's own level) and vsync
 anisotropic filtering (forced on mipmapped textures, overrides the game's own level), vsync,
 the gameplay tweaks and the control bindings are saved to ~/.config/rr2emu.cfg on every change.
 Gameplay tweaks (patches.c, host patch points: the game word becomes `svc #0x52nnnn` and
