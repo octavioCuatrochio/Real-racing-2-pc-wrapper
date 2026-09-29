@@ -66,6 +66,14 @@ The APK / OBB unpacking uses a built-in DEFLATE decoder, so zlib isn't needed on
 
 The in-game patches check every instruction word before changing it. On a different game build they simply don't apply.
 
+#### Real Racing 3 (experimental)
+
+Set **Game** to Real Racing 3 in the launcher. **DOWNLOAD** fetches Real Racing 3 14.0.1 (APK, 105 MB, and the Adreno game data, 6.2 GB, 9 GB unpacked) from the Internet Archive, as listed by [Project_RR3](https://viduxsh.github.io/Project_RR3/#downloads). It shows progress in the launcher and in desktop notifications, resumes if interrupted (Esc pauses), checks every file's CRC while unpacking, and saves both paths. Files go to `~/.local/share/rr2emu/rr3-14.0.1` (Windows: `%LOCALAPPDATA%\rr2emu\rr3-14.0.1`). The game data is also mirrored on [Mega](https://mega.nz/file/Q2ggiKSR#GZ1CXOUCs4NoHBtOiGEWOT1wau1ebhBoz6yWWWxfQyI) for downloading by hand.
+
+We do not own Real Racing 3 or any of its files; they belong to Electronic Arts and Firemonkeys Studios. The download is offered only because the game has been shut down, so that people can keep playing it.
+
+The 14.0.1 build does not run in rr2emu yet; 7.6.0 does.
+
 ---
 
 ## Build
