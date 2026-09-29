@@ -887,6 +887,7 @@ static void test_fuzz_blocks(cpu_t *c)
     for (int it = 0; it < 40000 && bad < 6; it++) {
         u32 code[N];
         for (int k = 0; k < N; ) {
+            if (k && !(fz() % 6)) { code[k++] = (fz() % 14) << 28 | 0x0A000000u | 0x100u; continue; }  /* b<cond> far ahead */
             u32 kind = fz() % 3, cond = (fz() & 3) ? 0xE : fz() % 15, insn = cond << 28;
             if (kind == 0) insn |= fz() & 0x03FFFFFFu;
             else if (kind == 1) insn |= 0x05000000u | (fz() & 0x00DFFFFFu);
@@ -904,9 +905,12 @@ static void test_fuzz_blocks(cpu_t *c)
 
         memcpy(c->r, r0, sizeof(r0)); c->cpsr = cpsr0; memset(&c->v, 0, sizeof(c->v)); c->fpscr = 0;
         memcpy(g2h(TDATA), mem0, MEM);
+        u32 end_pc = pc + 4 * N;
         for (int k = 0; k < N; k++) {
             c->r[15] = pc + 4 * k + 4;
-            if (cond_ok(code[k] >> 28, c->cpsr)) dec_table[DEC_KEY(code[k])](c, code[k]);
+            if (!cond_ok(code[k] >> 28, c->cpsr)) continue;
+            if (((code[k] >> 25) & 7) == 5) { end_pc = pc + 4 * k + 8 + 0x400; break; }
+            dec_table[DEC_KEY(code[k])](c, code[k]);
         }
         u32 rg[16], fg = c->cpsr; memcpy(rg, c->r, sizeof(rg)); memcpy(mem1, g2h(TDATA), MEM);
 
@@ -914,11 +918,12 @@ static void test_fuzz_blocks(cpu_t *c)
         memcpy(g2h(TDATA), mem0, MEM);
         if (!jit_test_seq(c, pc, code, N)) continue;
         tested++;
-        if (memcmp(rg, c->r, 15 * 4) || (fg & 0xF0000000u) != (c->cpsr & 0xF0000000u) || memcmp(mem1, g2h(TDATA), MEM)) {
+        if (memcmp(rg, c->r, 15 * 4) || (fg & 0xF0000000u) != (c->cpsr & 0xF0000000u) || memcmp(mem1, g2h(TDATA), MEM) ||
+            c->r[15] != end_pc) {
             bad++;
             LOG("BLOCK mismatch:");
             for (int k = 0; k < N; k++) LOG(" %08x", code[k]);
-            LOG("\n  cpsr %08x vs %08x", fg, c->cpsr);
+            LOG("\n  cpsr %08x vs %08x pc %08x vs %08x", fg, c->cpsr, end_pc, c->r[15]);
             for (int i = 0; i < 15; i++) if (rg[i] != c->r[i]) LOG(" r%d %08x vs %08x", i, rg[i], c->r[i]);
             LOG("%s\n", memcmp(mem1, g2h(TDATA), MEM) ? " (memory differs)" : "");
         }

@@ -86,6 +86,8 @@ static void pad_button(cpu_t *c, int btn, int down)
 /* SDL game-controller button index -> RR3 ControllerButtons */
 static const s8 sdl_to_rr3[15] = { 0, 1, 2, 3, 12, -1, 13, -1, -1, 4, 5, 10, 11, 8, 9 };
 
+static double g_gas_at = -1;                               /* RR2_GAS_AT=sec: full throttle from then (benchmarks) */
+static double since_start(void);
 static void rr3_input(cpu_t *c)
 {
     static float steer;
@@ -94,7 +96,8 @@ static void rr3_input(cpu_t *c)
     float d = g_input.steer_target - steer;
     steer += d > 0.12f ? 0.12f : d < -0.12f ? -0.12f : d;
     pad_axis(c, 0, steer);                                  /* AXIS_LTHUMB_X */
-    pad_axis(c, 5, g_input.gasv > 1 ? 1 : g_input.gasv);   /* AXIS_RTRIGGER */
+    float gas = g_gas_at >= 0 && since_start() >= g_gas_at ? 1 : g_input.gasv;
+    pad_axis(c, 5, gas > 1 ? 1 : gas);                      /* AXIS_RTRIGGER */
     pad_axis(c, 4, g_input.brakev > 1 ? 1 : g_input.brakev);   /* AXIS_LTRIGGER */
     u32 b = g_input.pad_btn, ch = b ^ prev_btn;
     for (int i = 0; i < 15; i++)
@@ -196,6 +199,7 @@ int rr3_main(const char *so_path)
     /* timed scripting: RR2_T_PROF / RR2_T_STOP seconds, RR2_T_SHOT png at stop, RR2_TAPS "sec:x,y;..." */
     double t_prof = getenv("RR2_T_PROF") ? atof(getenv("RR2_T_PROF")) : g_do_prof ? 0 : -1;
     double t_stop = getenv("RR2_T_STOP") ? atof(getenv("RR2_T_STOP")) : 0;
+    if (getenv("RR2_GAS_AT")) g_gas_at = atof(getenv("RR2_GAS_AT"));
     const char *taps = getenv("RR2_TAPS"), *shots = getenv("RR2_SHOTS"), *pads = getenv("RR2_PADS");
     struct timespec tb;
     clock_gettime(CLOCK_MONOTONIC, &tb);

@@ -255,7 +255,7 @@ static u8 *slot_alloc(void)
 }
 
 typedef struct { u8 *jmp_at; } pending_exit;
-static u8 *pend_slot_jmp[2 * JIT_MAX_INSNS + 8];
+static u8 *pend_slot_jmp[4 * JIT_MAX_INSNS + 16];
 static int npend;
 
 /* store pc, then jmp [rip+slot] with rax = &slot (the stub records it for linking) */
@@ -267,6 +267,25 @@ static void emit_exit_direct(u32 target)
     pend_slot_jmp[npend++] = lea_at;
     pend_slot_jmp[npend++] = jmp_at;
 }
+/* side exits: a taken conditional branch leaves mid-block; it takes back the instructions it
+ * skipped from insn_count once the block's length is known */
+static u8 *side_imm[JIT_MAX_INSNS + 8];
+static int side_done[JIT_MAX_INSNS + 8], nside;
+static void emit_side_exit(u32 target, int done)
+{
+    if (nside < JIT_MAX_INSNS + 8) {
+        e8(0x48); e8(0x81); e8(0x83); e32((u32)OFF_ICNT); side_imm[nside] = p; side_done[nside++] = done; e32(0);
+    }
+    emit_exit_direct(target);
+}
+static void patch_side_exits(int total)
+{
+    for (int i = 0; i < nside; i++) { s32 v = side_done[i] - total; memcpy(side_imm[i], &v, 4); }
+    nside = 0;
+}
+/* a forward jump over code that always leaves the block: nothing merges, keep the cache */
+static void patch32_over_exit(u8 *at) { s32 rel = (s32)(p - (at + 4)); memcpy(at, &rel, 4); }
+
 static void flush_slots(void)
 {
     for (int i = 0; i < npend; i += 2) {
@@ -1143,6 +1162,8 @@ bool jit_neon_covers(u32 insn)
 
 static int g_flag_ignore_abi = -1;
 static bool g_fuse_force_live;               /* selftest: always materialize flags */
+static int g_icount;                         /* instructions emitted so far in this block, excluding the current one */
+static bool g_skip_next;                     /* try_fused consumed the next word and the block goes on */
 static int g_fused_extra;                    /* instructions consumed beyond the current one */           /* RR2_JIT_SAFEFLAGS=1: never assume calls/returns kill flags */
 
 /* true if every path from pc overwrites NZCV before reading any of it (bounded scan) */
@@ -1256,6 +1277,16 @@ static bool try_fused(u32 pc, u32 insn, bool *ended)
     u32 target = pc + 12 + (u32)off, fall = pc + 8;
     bool link = (next >> 24) & 1;
     bool dead = !g_fuse_force_live && flags_dead(target, 8) && flags_dead(fall, 8);
+    if (!link && npend < 3 * JIT_MAX_INSNS) {                      /* taken: side exit; not taken: continue */
+        u8 *nt = jcc32(cc ^ 1);
+        if (!dead) { if (kind == 2) emit_flags(cm == 3 ? 3 : 0, 0, cv); else emit_flags(kind == 0 ? 2 : 1, 1, 0); }
+        emit_side_exit(target, g_icount + 2);
+        patch32_over_exit(nt);
+        if (!dead) { if (kind == 2) emit_flags(cm == 3 ? 3 : 0, 0, cv); else emit_flags(kind == 0 ? 2 : 1, 1, 0); }
+        g_fused_extra++;
+        g_skip_next = true;
+        return true;
+    }
     u8 *taken = jcc32(cc);
     /* not taken */
     if (!dead) { if (kind == 2) emit_flags(cm == 3 ? 3 : 0, 0, cv); else emit_flags(kind == 0 ? 2 : 1, 1, 0); }
@@ -1292,13 +1323,18 @@ static bool emit_insn(u32 pc, u32 insn, bool *ended)
         }
         return false;
     }
-    if (!g_tmode && cond == 0xE && cls <= 1 && try_fused(pc, insn, ended)) return true;
+    if (!g_tmode && cond == 0xE && cls <= 1 && try_fused(pc, insn, ended)) return *ended;
     u8 *skip = cond != 0xE ? emit_cond_skip(cond) : NULL;
 
     /* branches end the block */
     if (cls == 5) {
         s32 off = (s32)(insn << 8) >> 6;
         u32 target = pc + 8 + (u32)off;
+        if (skip && !(insn & (1u << 24)) && npend < 3 * JIT_MAX_INSNS) {   /* b<cond>: side exit, keep going */
+            emit_side_exit(target, g_icount + 1);
+            patch32_over_exit(skip);
+            return false;
+        }
         if (insn & (1u << 24)) st_imm(OFF_R(14), g_next);
         emit_exit_direct(target);
         if (skip) patch32(skip, p);
@@ -1486,11 +1522,13 @@ static void *compile_block_thumb(u32 pc0, int max_insns)
     while (n < max_insns && !ended) {
         if (pc - G.text_lo >= G.text_span) break;
         di_t d;
+        if (npend >= 3 * JIT_MAX_INSNS) break;
         thumb_decode(&d, pc);
         bool mx = d.insn && neon_needs_mx(d.insn);
         if (mx != g_mx_on) mx_emit(mx);
         u32 next = pc + d.len;
         g_next = next; g_fb_di = &d; g_ovr = false;
+        g_icount = n;
         n++;
         int op = d.op;
         u8 *skip = NULL;
@@ -1499,9 +1537,13 @@ static void *compile_block_thumb(u32 pc0, int max_insns)
         case OP_nop:
             break;
         case OP_br_b:
-            if (conditional) skip = emit_cond_skip(d.cond);
+            if (conditional) {                                    /* side exit, keep going */
+                skip = emit_cond_skip(d.cond);
+                emit_side_exit(d.a, n);
+                patch32_over_exit(skip);
+                break;
+            }
             emit_exit_direct(d.a);
-            if (skip) { patch32(skip, p); emit_exit_direct(next); }
             ended = true;
             break;
         case OP_br_bl: case OP_t_blxi:
@@ -1523,11 +1565,9 @@ static void *compile_block_thumb(u32 pc0, int max_insns)
         case OP_t_cbz: case OP_t_cbnz: {
             ld_r(RAX, OFF_R(d.rn));
             test_rr(RAX, RAX);
-            u8 *t = jcc32(op == OP_t_cbz ? CC_E : CC_NE);
-            emit_exit_direct(next);
-            patch32(t, p);
-            emit_exit_direct(d.a);
-            ended = true;
+            u8 *nt = jcc32(op == OP_t_cbz ? CC_NE : CC_E);
+            emit_side_exit(d.a, n);
+            patch32_over_exit(nt);
             break; }
         case OP_mov_const:
             if (conditional) skip = emit_cond_skip(d.cond);
@@ -1582,6 +1622,7 @@ static void *compile_block_thumb(u32 pc0, int max_insns)
     if (!ended) emit_exit_direct(pc);
     g_tmode = false; g_fb_di = NULL;
     flush_slots();
+    patch_side_exits(n);
     memcpy(cnt_at, &n, 4);
     jc_ptr = (u8 *)(((uintptr_t)p + 15) & ~(uintptr_t)15);
     return code;
@@ -1603,8 +1644,10 @@ static void *compile_block(u32 pc0, int max_insns)
     while (n < max_insns) {
         if (pc - G.text_lo >= G.text_span) break;
         u32 insn = ld32(pc);
+        if (npend >= 3 * JIT_MAX_INSNS) break;
         if (neon_needs_mx(insn) != g_mx_on) mx_emit(!g_mx_on);
         g_next = pc + 4;
+        g_icount = n + g_fused_extra;
         n++;
         if (max_insns == 1 && ((insn >> 25) & 7) <= 1 && (insn >> 28) == 0xE) {
             /* selftest single-insn mode: no fusion with a neighbour */
@@ -1614,12 +1657,14 @@ static void *compile_block(u32 pc0, int max_insns)
             if (e) break;
         } else if (emit_insn(pc, insn, &ended)) break;
         pc += 4;
+        if (g_skip_next) { pc += 4; g_skip_next = false; }
     }
     if (g_mx_on) mx_emit(0);
     if (!ended) emit_exit_direct(pc);            /* ran off the end: continue at the next pc */
     flush_slots();
     n += g_fused_extra;
     g_fused_extra = 0;
+    patch_side_exits(n);
     memcpy(cnt_at, &n, 4);
     jc_ptr = (u8 *)(((uintptr_t)p + 15) & ~(uintptr_t)15);
     return code;
