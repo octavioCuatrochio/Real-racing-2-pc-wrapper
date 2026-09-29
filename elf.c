@@ -42,6 +42,7 @@ typedef struct { u32 offset, info; } Elf32_Rel;
 #define DT_FINI_ARRAY 26
 #define DT_INIT_ARRAYSZ 27
 #define DT_FINI_ARRAYSZ 28
+#define DT_GNU_HASH 0x6ffffef5
 
 #define R_ARM_ABS32 2
 #define R_ARM_GLOB_DAT 21
@@ -57,7 +58,7 @@ typedef struct {
     u32  base, lo, hi;              /* load bias; mapped guest range */
     u32  text_lo, text_hi;
     u32  exidx, nexidx;
-    u32  symtab, strtab, nsym, hash; /* file offsets (vaddr == offset in these libs) */
+    u32  symtab, strtab, nsym, hash, gnu_hash; /* file offsets (converted from vaddrs through the LOAD segments) */
     u32  rel, relsz, jmprel, pltrelsz;
     u32  init, fini, init_array, init_arraysz, fini_array, fini_arraysz;
     int  needed[MAX_LIBS], nneeded; /* indices of guest deps */
@@ -83,9 +84,46 @@ static u32 elf_hash(const char *n)
     return h;
 }
 
-/* defined symbol in one library (DT_HASH lookup): guest address (Thumb functions keep bit0), 0 if none */
+static u32 gnu_hash(const char *n)
+{
+    u32 h = 5381;
+    while (*n) h = h * 33 + (u8)*n++;
+    return h;
+}
+static inline u32 rd32f(const lib_t *l, u32 off) { u32 v; memcpy(&v, l->file + off, 4); return v; }
+
+/* DT_GNU_HASH: nbuckets, symoffset, bloom words, bloom shift, bloom[], buckets[], chains[] */
+static u32 lib_sym_gnu(const lib_t *l, const char *name)
+{
+    u32 g = l->gnu_hash, nb = rd32f(l, g), symoff = rd32f(l, g + 4), nbloom = rd32f(l, g + 8);
+    if (!nb) return 0;
+    u32 buckets = g + 16 + 4 * nbloom, chains = buckets + 4 * nb, h = gnu_hash(name);
+    u32 i = rd32f(l, buckets + 4 * (h % nb));
+    if (i < symoff) return 0;
+    for (;; i++) {
+        u32 h2 = rd32f(l, chains + 4 * (i - symoff));
+        if ((h | 1) == (h2 | 1)) {
+            Elf32_Sym s = symat(l, i);
+            if (s.shndx && !strcmp(strat(l, s.name), name)) return l->base + s.value;
+        }
+        if (h2 & 1) return 0;
+    }
+}
+/* symbol count from DT_GNU_HASH: one past the last chain entry of the highest bucket */
+static u32 gnu_nsym(const lib_t *l)
+{
+    u32 g = l->gnu_hash, nb = rd32f(l, g), symoff = rd32f(l, g + 4), nbloom = rd32f(l, g + 8);
+    u32 buckets = g + 16 + 4 * nbloom, chains = buckets + 4 * nb, last = 0;
+    for (u32 b = 0; b < nb; b++) { u32 v = rd32f(l, buckets + 4 * b); if (v > last) last = v; }
+    if (last < symoff) return symoff;
+    while (!(rd32f(l, chains + 4 * (last - symoff)) & 1)) last++;
+    return last + 1;
+}
+
+/* defined symbol in one library (DT_HASH or DT_GNU_HASH lookup): guest address (Thumb functions keep bit0), 0 if none */
 static u32 lib_sym(const lib_t *l, const char *name)
 {
+    if (!l->hash) return l->gnu_hash ? lib_sym_gnu(l, name) : 0;
     u32 nbucket, h = elf_hash(name);
     memcpy(&nbucket, l->file + l->hash, 4);
     if (!nbucket) return 0;
@@ -133,6 +171,14 @@ static int find_lib(const char *name)
     return -1;
 }
 
+/* dynamic-table vaddr -> file offset through the LOAD segments (lld shifts later segments) */
+typedef struct { u32 n, va[8], off[8], sz[8]; } segs_t;
+static u32 v2o(const segs_t *s, u32 v)
+{
+    for (u32 k = 0; k < s->n; k++) if (v >= s->va[k] && v < s->va[k] + s->sz[k]) return v - s->va[k] + s->off[k];
+    return v;
+}
+
 /* map the file's segments at `base`, parse .dynamic, load guest deps; returns index */
 static int load_one(const char *path, u32 base)
 {
@@ -159,12 +205,14 @@ static int load_one(const char *path, u32 base)
     l->base = base;
     l->lo = ~0u;
     u32 dyn_off = 0, dyn_sz = 0;
+    segs_t seg = { 0 };
     for (int i = 0; i < eh.phnum; i++) {
         Elf32_Phdr ph;
         memcpy(&ph, file + eh.phoff + i * sizeof(ph), sizeof(ph));
         if (ph.type == PT_ARM_EXIDX) { l->exidx = base + ph.vaddr; l->nexidx = ph.memsz / 8; }
         if (ph.type == PT_DYNAMIC) { dyn_off = ph.offset; dyn_sz = ph.filesz; }
         if (ph.type != PT_LOAD) continue;
+        if (seg.n < 8) { seg.va[seg.n] = ph.vaddr; seg.off[seg.n] = ph.offset; seg.sz[seg.n] = ph.filesz; seg.n++; }
         u32 a = base + ph.vaddr;
         emu_prefault(g2h(a), ph.memsz);
         memcpy(g2h(a), file + ph.offset, ph.filesz);
@@ -182,12 +230,13 @@ static int load_one(const char *path, u32 base)
         if (!d.tag) break;
         switch (d.tag) {
         case DT_NEEDED: if (nneed < MAX_LIBS) needed_off[nneed++] = d.val; break;
-        case DT_SYMTAB: l->symtab = d.val; break;
-        case DT_STRTAB: l->strtab = d.val; break;
-        case DT_HASH: hash = d.val; break;
-        case DT_REL: l->rel = d.val; break;
+        case DT_SYMTAB: l->symtab = v2o(&seg, d.val); break;
+        case DT_STRTAB: l->strtab = v2o(&seg, d.val); break;
+        case DT_HASH: hash = v2o(&seg, d.val); break;
+        case DT_GNU_HASH: l->gnu_hash = v2o(&seg, d.val); break;
+        case DT_REL: l->rel = v2o(&seg, d.val); break;
         case DT_RELSZ: l->relsz = d.val; break;
-        case DT_JMPREL: l->jmprel = d.val; break;
+        case DT_JMPREL: l->jmprel = v2o(&seg, d.val); break;
         case DT_PLTRELSZ: l->pltrelsz = d.val; break;
         case DT_INIT: l->init = base + d.val; break;
         case DT_FINI: l->fini = base + d.val; break;
@@ -198,7 +247,9 @@ static int load_one(const char *path, u32 base)
         }
     }
     l->hash = hash;
-    memcpy(&l->nsym, file + hash + 4, 4);                  /* nchain */
+    if (hash) memcpy(&l->nsym, file + hash + 4, 4);        /* nchain */
+    else if (l->gnu_hash) l->nsym = gnu_nsym(l);
+    else fatal("%s: no DT_HASH or DT_GNU_HASH", path);
     LOG("[elf] %-22s %08x..%08x (text %08x..%08x, %u syms, exidx %u)\n",
         l->name, l->lo, l->hi, l->text_lo, l->text_hi, l->nsym, l->nexidx);
 
@@ -247,6 +298,8 @@ static void relocate(int idx)
             u32 S;
             if (s.shndx && !hle_wins(l, name)) S = l->base + s.value;   /* own definition */
             else S = resolve(name, &h);
+            if (h && (s.info & 0xF) == 1 /* STT_OBJECT */)
+                LOG("[elf] %s: data import %s has no definition (reads will see a code stub)\n", l->name, name);
             if (h) nhle++;
             if (type == R_ARM_ABS32) { st32(loc, S + ld32(loc)); nrel[1]++; }
             else { st32(loc, S); nrel[2]++; }

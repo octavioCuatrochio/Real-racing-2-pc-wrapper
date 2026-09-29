@@ -151,12 +151,100 @@ static void write_cpuinfo(void)
     fclose(f);
 }
 
+/* versionName from the APK's binary AndroidManifest.xml, so the game hears its own version */
+extern char g_rr3_version[32];
+char *vfs_host_path(const char *gpath);
+static u32 rd16le(const u8 *p) { return p[0] | p[1] << 8; }
+static u32 rd32le(const u8 *p) { return p[0] | p[1] << 8 | p[2] << 16 | (u32)p[3] << 24; }
+
+static u8 *zip_read(const char *zip, const char *want, u32 *outn)
+{
+    FILE *f = fopen(zip, "rb");
+    if (!f) return NULL;
+    u8 *res = NULL, tail[65557];
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f), tl = sz < (long)sizeof(tail) ? sz : (long)sizeof(tail);
+    fseek(f, sz - tl, SEEK_SET);
+    if (fread(tail, 1, (size_t)tl, f) != (size_t)tl) goto out;
+    const u8 *e = NULL;
+    for (long i = tl - 22; i >= 0 && !e; i--) if (rd32le(tail + i) == 0x06054b50) e = tail + i;
+    if (!e) goto out;
+    u32 count = rd16le(e + 10), cdsz = rd32le(e + 12), cdoff = rd32le(e + 16);
+    u8 *cd = malloc(cdsz);
+    fseek(f, cdoff, SEEK_SET);
+    if (!cd || fread(cd, 1, cdsz, f) != cdsz) { free(cd); goto out; }
+    const u8 *q = cd;
+    for (u32 k = 0; k < count && q + 46 <= cd + cdsz; k++) {
+        u32 nl = rd16le(q + 28), method = rd16le(q + 10), cs = rd32le(q + 20), us = rd32le(q + 24), lo = rd32le(q + 42);
+        if (nl == strlen(want) && !memcmp(q + 46, want, nl) && (method == 0 || method == 8)) {
+            u8 lh[30];
+            fseek(f, lo, SEEK_SET);
+            if (fread(lh, 1, 30, f) != 30) break;
+            fseek(f, lo + 30 + rd16le(lh + 26) + rd16le(lh + 28), SEEK_SET);
+            u8 *in = malloc(cs + 1), *o = malloc(us + 1);
+            if (in && o && fread(in, 1, cs, f) == cs && (method == 0 ? (memcpy(o, in, us), 1) : inflate_raw(in, cs, o, us) == 0)) { res = o; *outn = us; o = NULL; }
+            free(in); free(o);
+            break;
+        }
+        q += 46 + nl + rd16le(q + 30) + rd16le(q + 32);
+    }
+    free(cd);
+out:
+    fclose(f);
+    return res;
+}
+
+static void detect_version(void)
+{
+    char *apk = vfs_host_path("/data/app/com.ea.games.r3_row-1/base.apk");
+    u32 n = 0;
+    u8 *d = apk ? zip_read(apk, "AndroidManifest.xml", &n) : NULL;
+    free(apk);
+    if (!d) return;
+    u32 pool = 0, nstr = 0, utf8 = 0, sbase = 0;
+    for (u32 p = 8; p + 8 <= n; ) {
+        u32 type = rd16le(d + p), csz = rd32le(d + p + 4);
+        if (csz < 8 || p + csz > n) break;
+        if (type == 1) { pool = p; nstr = rd32le(d + p + 8); utf8 = rd32le(d + p + 16) & 0x100; sbase = p + rd32le(d + p + 20); }
+        #define STR(i, buf) do { u32 o_ = sbase + rd32le(d + pool + 28 + 4 * (i)); size_t k_ = 0; \
+            if (utf8) { o_ += (d[o_] & 0x80) ? 2 : 1; u32 l_ = d[o_] & 0x80 ? (d[o_] & 0x7F) << 8 | d[o_ + 1] : d[o_]; o_ += (d[o_] & 0x80) ? 2 : 1; \
+                        for (; k_ < l_ && k_ + 1 < sizeof(buf); k_++) buf[k_] = (char)d[o_ + k_]; } \
+            else { u32 l_ = rd16le(d + o_); for (; k_ < l_ && k_ + 1 < sizeof(buf); k_++) buf[k_] = (char)d[o_ + 2 + 2 * k_]; } \
+            buf[k_] = 0; } while (0)
+        if (type == 0x102 && pool) {
+            char name[32];
+            u32 ni = rd32le(d + p + 20);
+            if (ni >= nstr) break;
+            STR(ni, name);
+            if (!strcmp(name, "manifest")) {
+                u32 ac = rd16le(d + p + 28);
+                for (u32 a = 0; a < ac; a++) {
+                    const u8 *at = d + p + 36 + 20 * a;
+                    u32 an = rd32le(at + 4), raw = rd32le(at + 8);
+                    if (an >= nstr || raw >= nstr) continue;
+                    char key[32], val[32];
+                    STR(an, key);
+                    if (strcmp(key, "versionName")) continue;
+                    STR(raw, val);
+                    if (*val) snprintf(g_rr3_version, sizeof(g_rr3_version), "%s", val);
+                }
+                break;
+            }
+        }
+        #undef STR
+        p += csz;
+    }
+    free(d);
+    LOG("[rr3] game version %s\n", g_rr3_version);
+}
+
 int rr3_main(const char *so_path)
 {
     G.game = 3;
     if (!G.save_dir) G.save_dir = "./save_rr3";
     LOG("[rr3] loading %s (data %s, saves %s)\n", so_path, G.assets_dir, G.save_dir);
     write_cpuinfo();
+    detect_version();
     if (elf_load(&G, so_path) != 0) fatal("failed to load %s", so_path);
     if (getenv("RR2_STUBS")) { extern void hle_dump_stubs(void); hle_dump_stubs(); }
     patch_scene_scale();

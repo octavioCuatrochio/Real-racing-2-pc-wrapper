@@ -227,12 +227,14 @@ static void hle_pthread_getschedparam(cpu_t *c)
 typedef struct { volatile gptr addr; pthread_mutex_t m; } gmutex;
 typedef struct { volatile gptr addr; pthread_cond_t cv; } gcond;
 typedef struct { volatile gptr addr; sem_t s; } gsem;
+typedef struct { volatile gptr addr; pthread_rwlock_t rw; } grwlock;
 
 static gmutex *g_mutexes;
 static gcond  *g_conds;
 static gsem   *g_sems;
+static grwlock *g_rwlocks;
 static pthread_mutex_t sync_lock = PTHREAD_MUTEX_INITIALIZER;
-static int     g_nsync[3];
+static int     g_nsync[4];
 
 static inline u32 sync_hash(gptr a) { return (a * 2654435761u) >> (32 - SYNC_BITS); }
 
@@ -282,6 +284,7 @@ static void mutex_host_init(pthread_mutex_t *m, u32 bionic_word)
 SYNC_TABLE(mutex, gmutex, g_mutexes, m, mutex_host_init(&e->m, bionic_word), 0)
 SYNC_TABLE(cond, gcond, g_conds, cv, pthread_cond_init(&e->cv, NULL), 1)
 SYNC_TABLE(sem, gsem, g_sems, s, sem_init(&e->s, 0, 0), 2)
+SYNC_TABLE(rwlock, grwlock, g_rwlocks, rw, pthread_rwlock_init(&e->rw, NULL), 3)
 
 static pthread_mutex_t *mutex_for(gptr addr) { return &mutex_slot(addr, true, ld32(addr))->m; }
 static pthread_cond_t *cond_for(gptr addr)   { return &cond_slot(addr, true, 0)->cv; }
@@ -311,6 +314,21 @@ static void hle_pthread_mutex_destroy(cpu_t *c)
     if (e) sync_destroy(&e->addr);
     hret(c, 0);
 }
+/* rwlocks: the guest object (40 bytes, zero = PTHREAD_RWLOCK_INITIALIZER) keys a host rwlock */
+static pthread_rwlock_t *rwlock_for(gptr addr) { return &rwlock_slot(addr, true, 0)->rw; }
+static void hle_pthread_rwlock_init(cpu_t *c)    { rwlock_for(harg(c, 0)); hret(c, 0); }
+static void hle_pthread_rwlock_rdlock(cpu_t *c)  { hret(c, (u32)pthread_rwlock_rdlock(rwlock_for(harg(c, 0)))); }
+static void hle_pthread_rwlock_wrlock(cpu_t *c)  { hret(c, (u32)pthread_rwlock_wrlock(rwlock_for(harg(c, 0)))); }
+static void hle_pthread_rwlock_tryrdlock(cpu_t *c) { hret(c, (u32)pthread_rwlock_tryrdlock(rwlock_for(harg(c, 0)))); }
+static void hle_pthread_rwlock_trywrlock(cpu_t *c) { hret(c, (u32)pthread_rwlock_trywrlock(rwlock_for(harg(c, 0)))); }
+static void hle_pthread_rwlock_unlock(cpu_t *c)  { hret(c, (u32)pthread_rwlock_unlock(rwlock_for(harg(c, 0)))); }
+static void hle_pthread_rwlock_destroy(cpu_t *c)
+{
+    grwlock *e = rwlock_slot(harg(c, 0), false, 0);
+    if (e) { pthread_rwlock_destroy(&e->rw); sync_destroy(&e->addr); }
+    hret(c, 0);
+}
+
 static void hle_pthread_mutex_lock(cpu_t *c)    { pthread_mutex_lock(mutex_for(harg(c, 0))); hret(c, 0); }
 static void hle_pthread_mutex_trylock(cpu_t *c) { hret(c, (u32)pthread_mutex_trylock(mutex_for(harg(c, 0)))); }
 static void hle_pthread_mutex_unlock(cpu_t *c)  { pthread_mutex_unlock(mutex_for(harg(c, 0))); hret(c, 0); }
@@ -608,6 +626,13 @@ void sync_init(void)
     hle_register("pthread_getschedparam", hle_pthread_getschedparam);
     hle_register("pthread_mutex_init", hle_pthread_mutex_init);
     hle_register("pthread_mutex_destroy", hle_pthread_mutex_destroy);
+    hle_register("pthread_rwlock_init", hle_pthread_rwlock_init);
+    hle_register("pthread_rwlock_rdlock", hle_pthread_rwlock_rdlock);
+    hle_register("pthread_rwlock_wrlock", hle_pthread_rwlock_wrlock);
+    hle_register("pthread_rwlock_tryrdlock", hle_pthread_rwlock_tryrdlock);
+    hle_register("pthread_rwlock_trywrlock", hle_pthread_rwlock_trywrlock);
+    hle_register("pthread_rwlock_unlock", hle_pthread_rwlock_unlock);
+    hle_register("pthread_rwlock_destroy", hle_pthread_rwlock_destroy);
     hle_register("pthread_mutex_lock", hle_pthread_mutex_lock);
     hle_register("pthread_mutex_trylock", hle_pthread_mutex_trylock);
     hle_register("pthread_mutex_unlock", hle_pthread_mutex_unlock);

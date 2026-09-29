@@ -746,6 +746,14 @@ static void hle_vfprintf(cpu_t *c)
     fwrite(buf, 1, n, f);
     hret(c, (u32)n);
 }
+static void hle_vprintf(cpu_t *c)
+{
+    char buf[4096];
+    gva_t w = { .c = c, .vlist = harg(c,1) };
+    size_t n = gfmt(buf, sizeof(buf), harg(c,0), &w);
+    fwrite(buf, 1, n, stdout);
+    hret(c, (u32)n);
+}
 void hle_sscanf(cpu_t *c)
 {
     scan_src src = { .c = c, .p = GSTR(harg(c,0)), .f = NULL };
@@ -1301,7 +1309,7 @@ static void hle_android_log_write(cpu_t *c)
 
 gptr hle_data_object(const char *name)
 {
-    static gptr sf, guard, ctype, tolower_tab, toupper_tab, tzname_o, page_size_o, timezone_o;
+    static gptr sf, guard, ctype, tolower_tab, toupper_tab, tzname_o, page_size_o, timezone_o, environ_o, stdio_o[3];
     static bool inited;
     if (!inited) {
         inited = true;
@@ -1343,7 +1351,16 @@ gptr hle_data_object(const char *name)
         page_size_o = hle_data_alloc(4, 4);
         st32(page_size_o, 4096);
         timezone_o = hle_data_alloc(4, 4);
+        /* `char **environ`: an empty environment, matching getenv (always NULL) */
+        gptr env = hle_data_alloc(4, 4);
+        environ_o = hle_data_alloc(4, 4); st32(environ_o, env);
+        /* API 23+ Bionic: `FILE *stdin/stdout/stderr` variables pointing into __sF */
+        for (int i = 0; i < 3; i++) { stdio_o[i] = hle_data_alloc(4, 4); st32(stdio_o[i], g_sf[i]); }
     }
+    if (!strcmp(name, "environ")) return environ_o;
+    if (!strcmp(name, "stdin")) return stdio_o[0];
+    if (!strcmp(name, "stdout")) return stdio_o[1];
+    if (!strcmp(name, "stderr")) return stdio_o[2];
     if (!strcmp(name, "timezone")) return timezone_o;
     if (!strcmp(name, "__sF")) return sf;
     if (!strcmp(name, "__stack_chk_guard")) return guard;
@@ -1400,6 +1417,7 @@ static void hle_drand48(cpu_t *c)
 }
 
 #include "hle_libc2.inc"
+#include "hle_libc3.inc"
 
 void libc_init(void)
 {
@@ -1461,10 +1479,12 @@ void libc_init(void)
     hle_register("vsnprintf", hle_vsnprintf);
     hle_register("fprintf", hle_fprintf);
     hle_register("vfprintf", hle_vfprintf);
+    hle_register("vprintf", hle_vprintf);
     hle_register("sscanf", hle_sscanf);
     hle_register("fscanf", hle_fscanf);
 
     hle_register("open", hle_open);
+    hle_register("__open_2", hle_open);                  /* FORTIFY open without a mode */
     hle_register("close", hle_close);
     hle_register("read", hle_read);
     hle_register("write", hle_write);
@@ -1538,4 +1558,5 @@ void libc_init(void)
     hle_register("__android_log_vprint", hle_android_log_vprint);
     hle_register("__android_log_write", hle_android_log_write);
     libc2_init();
+    libc3_init();
 }

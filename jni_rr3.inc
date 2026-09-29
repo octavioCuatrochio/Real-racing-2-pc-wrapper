@@ -12,6 +12,8 @@
 #define RR3_APK   "/data/app/" RR3_PKG "-1/base.apk"
 #define PLAT      "com/firemint/realracing/Platform"
 
+char g_rr3_version[32] = "7.6.0";                 /* versionName of the APK's manifest (rr3.c) */
+
 static u64 j_null(cpu_t *c, u32 self, jargs_t *a)  { return 0; }
 static u64 j_false(cpu_t *c, u32 self, jargs_t *a) { return 0; }
 static u64 j_long(cpu_t *c, u32 self, jargs_t *a)  { return ((u64)cur_meth->ent->iv) << 20; }   /* iv in MB */
@@ -60,7 +62,7 @@ static const jimpl_ent rr3_impls[] = {
     { PLAT, "getCpuSpeed",           NULL, j_int, NULL, 2350000 },
     { PLAT, "getCpuName",            NULL, j_str, "Qualcomm Technologies, Inc MSM8998" },
     { PLAT, "getAppName",            NULL, j_str, "Real Racing 3" },
-    { PLAT, "getAppVersion",         NULL, j_str, "7.6.0" },
+    { PLAT, "getAppVersion",         NULL, j_str, g_rr3_version },
     { PLAT, "getAppPath",            NULL, j_str, RR3_APK },
     { PLAT, "getAppInstallTime",     NULL, j_install_time },
     { PLAT, "getApiLevel",           NULL, j_int, NULL, 25 },

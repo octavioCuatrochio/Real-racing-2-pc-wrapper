@@ -24,6 +24,14 @@ void hle_register(const char *name, hle_fn fn)
     pthread_mutex_unlock(&hle_lock);
 }
 
+/* register `name` with the handler already registered as `existing` */
+bool hle_alias(const char *name, const char *existing)
+{
+    for (int i = 1; i < hle_n; i++)
+        if (!strcmp(hle_names[i], existing)) { hle_register(name, hle_fns[i]); return true; }
+    return false;
+}
+
 static void hle_stub(cpu_t *c)
 {
     u32 idx = (c->r[15] - HLE_SLOT_BASE) / HLE_SLOT_STRIDE;

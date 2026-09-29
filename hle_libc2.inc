@@ -295,6 +295,11 @@ static void hle_isnand(cpu_t *c) { hret(c, isnan(harg_d(c)) ? 1 : 0); }
 static void hle_ret0(cpu_t *c) { hret(c, 0); }
 static void hle_retm1(cpu_t *c) { guest_errno_set(c, 38 /* ENOSYS */); hret(c, (u32)-1); }
 static void hle_getpid(cpu_t *c) { hret(c, 4242); }
+static u32 g_rand_state = 1;
+static void hle_srand(cpu_t *c) { g_rand_state = harg(c,0) ? harg(c,0) : 1; hret(c, 0); }
+static void hle_rand(cpu_t *c)  { g_rand_state = g_rand_state * 1103515245u + 12345u; hret(c, (g_rand_state >> 1) & 0x7FFFFFFFu); }
+static void hle_signal(cpu_t *c) { hret(c, 0); }       /* guest signals are never delivered: old handler SIG_DFL */
+static void hle_strlen_chk(cpu_t *c) { hret(c, (u32)strlen(GSTR(harg(c,0)))); }
 static void hle_getuid(cpu_t *c) { hret(c, 10127); }
 static void hle_getpwuid_r(cpu_t *c) { if (harg(c,4)) st32(harg(c,4), 0); hret(c, 2 /* ENOENT */); }
 static void hle_dup2(cpu_t *c) { hret(c, (u32)dup2((int)harg(c,0), (int)harg(c,1))); }
@@ -661,6 +666,8 @@ static void libc2_init(void)
     hle_register("getgid", hle_getuid); hle_register("getegid", hle_getuid); hle_register("getpwuid_r", hle_getpwuid_r);
     hle_register("ptrace", hle_ret0); hle_register("kill", hle_ret0); hle_register("sigaction", hle_ret0);
     hle_register("bsd_signal", hle_ret0); hle_register("pipe", hle_retm1); hle_register("socketpair", hle_retm1);
+    hle_register("srand", hle_srand); hle_register("rand", hle_rand); hle_register("signal", hle_signal);
+    hle_register("__strlen_chk", hle_strlen_chk);
     hle_register("execl", hle_retm1); hle_register("dup2", hle_dup2); hle_register("select", hle_select);
     hle_register("sem_open", hle_sem_open); hle_register("sem_close", hle_ret0); hle_register("sem_unlink", hle_sem_unlink);
     hle_register("getaddrinfo", hle_getaddrinfo); hle_register("freeaddrinfo", hle_ret0);

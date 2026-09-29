@@ -290,6 +290,7 @@ static void hle_mmap(cpu_t *c)
         VLOG(1, "[hle] mmap fd=%d read failed\n", fd);
     hret(c, a);
 }
+void hle_mmap_entry(cpu_t *c) { hle_mmap(c); }
 static void hle_munmap(cpu_t *c)
 {
     guest_munmap_pages(harg(c, 0), (harg(c, 1) + 4095) / 4096);
