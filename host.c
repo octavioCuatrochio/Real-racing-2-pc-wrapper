@@ -107,16 +107,18 @@ static struct {
     void  (*StopTextInput)(void);
     int   (*EventState)(u32, int);
     const char *(*GetKeyName)(s32);
+    void  (*DestroyWindow)(void *);
 } sdl;
 typedef struct { u32 format; int w, h, refresh_rate; void *driverdata; } sdl_display_mode;
 static void *sdl_lib;
 
 static void *g_win, *g_ctx;
+int g_gl_desktop;
 static host_input_fn g_input_cb;
 
 bool host_video_init(int w, int h, int vsync)
 {
-    void *lib = sdl_lib = dlopen("libSDL2-2.0.so.0", RTLD_NOW | RTLD_LOCAL);
+    void *lib = sdl_lib = dlopen(SDL_LIBNAME, RTLD_NOW | RTLD_LOCAL);
     if (!lib) { LOG("[host] SDL2 not available (%s), running headless\n", dlerror()); return false; }
 #define SYM(field, name) if (!(*(void **)&sdl.field = dlsym(lib, name))) { LOG("[host] missing %s\n", name); return false; }
     SYM(Init, "SDL_Init") SYM(GetError, "SDL_GetError") SYM(GL_SetAttribute, "SDL_GL_SetAttribute")
@@ -135,26 +137,38 @@ bool host_video_init(int w, int h, int vsync)
     SYM(GL_GetDrawableSize, "SDL_GL_GetDrawableSize") SYM(GetClipboardText, "SDL_GetClipboardText")
     SYM(free, "SDL_free") SYM(StartTextInput, "SDL_StartTextInput") SYM(StopTextInput, "SDL_StopTextInput")
     SYM(EventState, "SDL_EventState") SYM(GetKeyName, "SDL_GetKeyName")
+    SYM(DestroyWindow, "SDL_DestroyWindow")
 #undef SYM
     if (sdl.Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER) != 0) {
         LOG("[host] SDL_Init failed: %s\n", sdl.GetError());
         return false;
     }
-    sdl.GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
-    sdl.GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
-    sdl.GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
-    sdl.GL_SetAttribute(SDL_GL_RED_SIZE, 8);
-    sdl.GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
-    sdl.GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
-    sdl.GL_SetAttribute(SDL_GL_ALPHA_SIZE, 0);
-    sdl.GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
-    sdl.GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
-    sdl.GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-    g_win = sdl.CreateWindow("Real Racing 2 (rr2emu)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                             w, h, SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN);
-    if (!g_win) { LOG("[host] window: %s\n", sdl.GetError()); return false; }
-    g_ctx = sdl.GL_CreateContext(g_win);
-    if (!g_ctx) { LOG("[host] GLES2 context: %s\n", sdl.GetError()); return false; }
+    /* OpenGL ES 2 where the driver offers it, else desktop GL 2.1 with the shaders rewritten (glhost.c) */
+    const char *want = getenv("RR2_GL");
+    for (int attempt = want && !strcmp(want, "desktop"); attempt < 2 && !g_ctx; attempt++) {
+        g_gl_desktop = attempt;
+        sdl.GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, attempt ? 0 : SDL_GL_CONTEXT_PROFILE_ES);
+        sdl.GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+        sdl.GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, attempt ? 1 : 0);
+        sdl.GL_SetAttribute(SDL_GL_RED_SIZE, 8);
+        sdl.GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
+        sdl.GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
+        sdl.GL_SetAttribute(SDL_GL_ALPHA_SIZE, 0);
+        sdl.GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+        sdl.GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+        sdl.GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+        g_win = sdl.CreateWindow("Real Racing 2 (rr2emu)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                 w, h, SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN);
+        if (g_win) g_ctx = sdl.GL_CreateContext(g_win);
+        if (!g_ctx) {
+            LOG("[host] %s context: %s\n", attempt ? "desktop GL" : "GLES2", sdl.GetError());
+            if (g_win) sdl.DestroyWindow(g_win);
+            g_win = NULL;
+            if (want && !strcmp(want, "es")) break;
+        }
+    }
+    if (!g_ctx) return false;
+    if (g_gl_desktop) LOG("[host] using desktop OpenGL (GLES2 shaders translated)\n");
     sdl.GL_MakeCurrent(g_win, g_ctx);
     sdl.GL_SetSwapInterval(vsync ? 1 : 0);
     for (int i = 0; i < sdl.NumJoysticks(); i++)

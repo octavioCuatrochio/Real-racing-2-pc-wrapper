@@ -4,6 +4,9 @@
  * ~/.config/rr2emu.cfg; an APK or OBB/zip is unpacked once into ~/.cache/rr2emu.
  */
 #include "emu.h"
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <dlfcn.h>
 #include <dirent.h>
 #include <strings.h>
@@ -326,17 +329,64 @@ static const char *const f_bolditalic[] = { FONT_DIR "opentype/urw-base35/Nimbus
     FONT_DIR "truetype/liberation/LiberationSans-BoldItalic.ttf", NULL };
 static float logo_slant;
 
+#ifdef _WIN32
+/* Windows: GDI rasterizes the system's Arial, so no FreeType DLL is needed */
+static bool font_gdi(font_t *ft, int px, int bold, int italic)
+{
+    HDC dc = CreateCompatibleDC(NULL);
+    HFONT f = CreateFontA(-px, 0, 0, 0, bold ? FW_BOLD : FW_NORMAL, italic, 0, 0, ANSI_CHARSET, OUT_TT_PRECIS,
+                          CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, "Arial");
+    if (!dc || !f) return false;
+    HGDIOBJ old = SelectObject(dc, f);
+    TEXTMETRICA tm;
+    GetTextMetricsA(dc, &tm);
+    ft->asc = tm.tmAscent;
+    ft->height = tm.tmHeight + tm.tmExternalLeading;
+    static const MAT2 m = { { 0, 1 }, { 0, 0 }, { 0, 0 }, { 0, 1 } };
+    static u8 buf[256 * 256];
+    for (int ch = 32; ch < 127; ch++) {
+        glyph_t *g = &ft->g[ch - 32];
+        memset(g, 0, sizeof(*g));
+        GLYPHMETRICS gm;
+        DWORD n = GetGlyphOutlineA(dc, (UINT)ch, GGO_GRAY8_BITMAP, &gm, sizeof(buf), buf, &m);
+        INT adv = 0;
+        g->adv = GetCharWidth32A(dc, (UINT)ch, (UINT)ch, &adv) ? (short)adv : (short)gm.gmCellIncX;
+        if (n == GDI_ERROR || !n || !gm.gmBlackBoxX) continue;
+        int w = (int)gm.gmBlackBoxX, h = (int)gm.gmBlackBoxY, pitch = (w + 3) & ~3, ox, oy;
+        if (!atlas_put(w, h, &ox, &oy)) continue;
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++) {
+                int v = buf[y * pitch + x] * 255 / 64;           /* GGO_GRAY8: 0..64 */
+                atlas[(oy + y) * AT + ox + x] = (u8)(v > 255 ? 255 : v);
+            }
+        g->x = ox; g->y = oy; g->w = w; g->h = h;
+        g->left = (short)gm.gmptGlyphOrigin.x;
+        g->top = (short)gm.gmptGlyphOrigin.y;
+    }
+    SelectObject(dc, old);
+    DeleteObject(f);
+    DeleteDC(dc);
+    return true;
+}
+#endif
+
 static void fonts_load(void)
 {
     static const struct { const char *const *files; int px; } spec[NFONTS] = {
         { f_regular, 14 }, { f_regular, 18 }, { f_bold, 18 }, { f_bold, 21 }, { f_bolditalic, 17 }, { f_bolditalic, 38 } };
     memset(atlas, 255, 4 * AT);
     for (int i = 0; i < NFONTS; i++)
+#ifdef _WIN32
+        if (!font_gdi(&fonts[i], spec[i].px, spec[i].files != f_regular, spec[i].files == f_bolditalic)) {
+#else
         if (!font_ft(&fonts[i], spec[i].files, spec[i].px)) {
+#endif
             font_bitmap(&fonts[i], spec[i].px);
             if (i >= F_HEAD) logo_slant = 0.2f;
         }
+#ifndef _WIN32
     if (!ft_new_face) LOG("[launcher] FreeType not found, using the built-in pixel font\n");
+#endif
 }
 
 static void flush(void)
@@ -358,7 +408,7 @@ static bool gl_setup(void)
         "attribute vec2 p; attribute vec2 t; attribute vec4 c; varying vec2 vt; varying vec4 vc;"
         "void main() { gl_Position = vec4(p.x / 400.0 - 1.0, 1.0 - p.y / 320.0, 0.0, 1.0); vt = t; vc = c; }";
     static const char *fs =
-        "precision mediump float; uniform sampler2D s; varying vec2 vt; varying vec4 vc;"
+        "#ifdef GL_ES\nprecision mediump float;\n#endif\nuniform sampler2D s; varying vec2 vt; varying vec4 vc;"
         "void main() { gl_FragColor = vec4(vc.rgb, vc.a * texture2D(s, vt).a); }";
     shaders[0] = gl.CreateShader(0x8B31);
     shaders[1] = gl.CreateShader(0x8B30);
@@ -418,11 +468,19 @@ static int csel_r, csel_c, capturing;   /* controls page: cursor row/column, wai
 #define FOV_MAX 40
 #define FOV_STEP 5
 
+/* config: $XDG_CONFIG_HOME or ~/.config (Windows: %APPDATA%\rr2emu); cache: ~/.cache (%LOCALAPPDATA%) */
 static void home_path(char *out, size_t n, const char *xdg, const char *fallback, const char *leaf)
 {
+#ifdef _WIN32
+    int config = !strcmp(xdg, "XDG_CONFIG_HOME");
+    const char *b = getenv(config ? "APPDATA" : "LOCALAPPDATA");
+    snprintf(out, n, config ? "%s/rr2emu/%s" : "%s/%s", b ? b : ".", leaf);
+    (void)fallback;
+#else
     const char *x = getenv(xdg), *h = getenv("HOME");
     if (x && *x) snprintf(out, n, "%s/%s", x, leaf);
     else snprintf(out, n, "%s/%s/%s", h ? h : ".", fallback, leaf);
+#endif
 }
 
 static void cfg_load(void)
@@ -458,8 +516,8 @@ static void mkdirs(const char *path)
     char p[1100];
     snprintf(p, sizeof(p), "%s", path);
     for (char *s = p + 1; *s; s++)
-        if (*s == '/') { *s = 0; mkdir(p, 0755); *s = '/'; }
-    mkdir(p, 0755);
+        if (strchr(PATH_SEP_CHARS, *s)) { char k = *s; *s = 0; emu_mkdir(p, 0755); *s = k; }
+    emu_mkdir(p, 0755);
 }
 
 /* every change is saved right away */
@@ -747,29 +805,6 @@ static void draw(void)
 static bool is_dir(const char *p) { struct stat st; return stat(p, &st) == 0 && S_ISDIR(st.st_mode); }
 static bool is_file(const char *p) { struct stat st; return stat(p, &st) == 0 && S_ISREG(st.st_mode); }
 
-typedef struct {
-    const u8 *next_in; unsigned avail_in; unsigned long total_in;
-    u8 *next_out; unsigned avail_out; unsigned long total_out;
-    const char *msg; void *state, *zalloc, *zfree, *opaque;
-    int data_type; unsigned long adler, reserved;
-} z_stream;
-static int (*z_init)(z_stream *, int, const char *, int);
-static int (*z_inflate)(z_stream *, int);
-static int (*z_end)(z_stream *);
-static const char *(*z_version)(void);
-
-static bool zlib_load(void)
-{
-    if (z_inflate) return true;
-    void *lib = dlopen("libz.so.1", RTLD_NOW | RTLD_LOCAL);
-    if (!lib) return false;
-    *(void **)&z_init = dlsym(lib, "inflateInit2_");
-    *(void **)&z_inflate = dlsym(lib, "inflate");
-    *(void **)&z_end = dlsym(lib, "inflateEnd");
-    *(void **)&z_version = dlsym(lib, "zlibVersion");
-    return z_init && z_inflate && z_end && z_version;
-}
-
 static u16 rd16(const u8 *p) { return p[0] | p[1] << 8; }
 static u32 rd32(const u8 *p) { return p[0] | p[1] << 8 | p[2] << 16 | (u32)p[3] << 24; }
 
@@ -789,14 +824,14 @@ static bool entry_wanted(const char *name, int apk_mode)
 
 static bool unzip(const char *zip, const char *dest, int apk_mode, const char *what)
 {
-    int fd = open(zip, O_RDONLY);
+    int fd = open(zip, O_RDONLY | O_BINARY);
     if (fd < 0) { set_status(0xc62828ffu, "cannot open %s", zip); return false; }
     struct stat st;
     fstat(fd, &st);
     u8 tail[65557];
     off_t tl = st.st_size < (off_t)sizeof(tail) ? st.st_size : (off_t)sizeof(tail);
     const u8 *eocd = NULL;
-    if (pread(fd, tail, tl, st.st_size - tl) == tl)
+    if (emu_pread(fd, tail, (size_t)tl, st.st_size - tl) == tl)
         for (off_t i = tl - 22; i >= 0 && !eocd; i--) if (rd32(tail + i) == 0x06054b50) eocd = tail + i;
     if (!eocd || rd32(eocd + 16) == 0xFFFFFFFFu) {
         close(fd);
@@ -804,9 +839,9 @@ static bool unzip(const char *zip, const char *dest, int apk_mode, const char *w
         return false;
     }
     u32 count = rd16(eocd + 10), cd_size = rd32(eocd + 12), cd_off = rd32(eocd + 16);
-    u8 *cd = malloc(cd_size), *in = malloc(1 << 20), *out = malloc(1 << 20);
-    bool ok = pread(fd, cd, cd_size, cd_off) == (ssize_t)cd_size && zlib_load();
-    if (!ok) set_status(0xc62828ffu, "cannot read %s (zlib missing?)", what);
+    u8 *cd = malloc(cd_size);
+    bool ok = emu_pread(fd, cd, cd_size, cd_off) == (long)cd_size;
+    if (!ok) set_status(0xc62828ffu, "cannot read %s", what);
     u64 total = 0, done = 0;
     for (int pass = 0; pass < 2 && ok; pass++) {
         const u8 *e = cd;
@@ -822,35 +857,22 @@ static bool unzip(const char *zip, const char *dest, int apk_mode, const char *w
             char path[2100];
             snprintf(path, sizeof(path), "%s/%s", dest, name);
             if (name[strlen(name) - 1] == '/') { mkdirs(path); continue; }
-            *strrchr(path, '/') = 0;
+            *strrchr(path, '/') = 0;             /* entry names always use '/' */
             mkdirs(path);
             path[strlen(path)] = '/';
             u8 lh[30];
-            if (pread(fd, lh, 30, loff) != 30 || rd32(lh) != 0x04034b50 || (method != 0 && method != 8)) { ok = false; break; }
-            off_t pos = loff + 30 + rd16(lh + 26) + rd16(lh + 28);
-            FILE *f = fopen(path, "wb");
-            if (!f) { ok = false; break; }
-            z_stream z = { 0 };
-            if (method == 8 && z_init(&z, -15, z_version(), sizeof(z)) != 0) { fclose(f); ok = false; break; }
-            u32 left = csize;
-            int zr = 0;
-            while (ok && (left || (method == 8 && zr != 1))) {
-                u32 n = left < (1u << 20) ? left : (1u << 20);
-                if (n && pread(fd, in, n, pos) != (ssize_t)n) { ok = false; break; }
-                pos += n; left -= n;
-                if (method == 0) { ok = fwrite(in, 1, n, f) == n; done += n; continue; }
-                z.next_in = in; z.avail_in = n;
-                do {
-                    z.next_out = out; z.avail_out = 1u << 20;
-                    zr = z_inflate(&z, 0);
-                    if (zr < 0 && zr != -5) { ok = false; break; }
-                    size_t got = (1u << 20) - z.avail_out;
-                    if (fwrite(out, 1, got, f) != got) ok = false;
-                    done += got;
-                } while (ok && z.avail_out == 0);
-                if (!n && zr != 1) ok = false;
-            }
-            if (method == 8) z_end(&z);
+            if (emu_pread(fd, lh, 30, loff) != 30 || rd32(lh) != 0x04034b50 || (method != 0 && method != 8)) { ok = false; break; }
+            long long pos = (long long)loff + 30 + rd16(lh + 26) + rd16(lh + 28);
+            u8 *in = malloc(csize + 1), *out = method == 8 ? malloc(usize + 1) : in;
+            ok = in && out && emu_pread(fd, in, csize, pos) == (long)csize &&
+                 (method == 0 || inflate_raw(in, csize, out, usize) == 0);
+            FILE *f = ok ? fopen(path, "wb") : NULL;
+            if (!f) ok = false;
+            else if (fwrite(out, 1, method == 8 ? usize : csize, f) != (method == 8 ? usize : csize)) ok = false;
+            if (out != in) free(out);
+            free(in);
+            done += usize;
+            if (!f) { set_status(0xc62828ffu, "failed unpacking %s", name); break; }
             if (fclose(f) != 0) ok = false;
             static struct timespec last;
             struct timespec now;
@@ -867,7 +889,7 @@ static bool unzip(const char *zip, const char *dest, int apk_mode, const char *w
             if (!ok) set_status(0xc62828ffu, "failed unpacking %s", name);
         }
     }
-    free(cd); free(in); free(out);
+    free(cd);
     close(fd);
     if (ok) {
         char mark[1100];
@@ -920,7 +942,8 @@ static bool prepare(void)
     else if (is_file(data)) { if (!unpack_cached(data, "data", 0, root, sizeof(root))) return false; }
     else { set_status(0xc62828ffu, "%s", *data ? "Game data not found" : "Choose the game data (OBB or zip)"); sel = R_DATA; return false; }
     if (!has_game_dir(root)) {
-        char *slash = strrchr(root, '/');
+        char *slash = NULL;
+        for (char *q = root; *q; q++) if (strchr(PATH_SEP_CHARS, *q)) slash = q;
         if (slash && !strncmp(slash + 1, "com.ea.game.realracing2", 23)) *slash = 0;
         else { set_status(0xc62828ffu, "%s", "No com.ea.game.realracing2_* folder in the game data"); sel = R_DATA; return false; }
     }
@@ -939,7 +962,7 @@ static void clean_path(char *dst, size_t n, const char *src)
     else snprintf(dst, n, "%s", src);
     size_t l = strlen(dst);
     while (l && strchr(" \t\r\n'\"", dst[l - 1])) dst[--l] = 0;
-    char *r = realpath(dst, NULL);
+    char *r = emu_realpath(dst);
     if (r) { snprintf(dst, n, "%s", r); free(r); }
 }
 

@@ -725,7 +725,10 @@ void marshal_stat(gptr out, const struct stat *st);
 static void test_stat_layout(void)
 {
     struct stat st = { 0 };
-    st.st_mode = 0100644; st.st_size = 0x123456789LL; st.st_blksize = 4096; st.st_ino = 77;
+    st.st_mode = 0100644; st.st_size = 0x123456789LL; st.st_ino = 77;
+#ifndef _WIN32
+    st.st_blksize = 4096;
+#endif
     gptr o = TDATA + 0xC00;
     memset(g2h(o), 0xEE, 128);
     marshal_stat(o, &st);

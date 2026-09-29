@@ -85,9 +85,9 @@ static void cpu_run_trace(cpu_t *c)
     }
 }
 
-void d_decode(cpu_t *c, const di_t *d);
-void d_generic(cpu_t *c, const di_t *d);
-void d_hook(cpu_t *c, const di_t *d);
+JITCALL void d_decode(cpu_t *c, const di_t *d);
+JITCALL void d_generic(cpu_t *c, const di_t *d);
+JITCALL void d_hook(cpu_t *c, const di_t *d);
 
 /*
  * Direct-threaded dispatch: every op label ends in its own copy of DISPATCH,

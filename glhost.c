@@ -262,6 +262,35 @@ static void h_glGetVertexAttribPointerv(cpu_t *c)
     u8 *h = hp;
     st32(A(2), (h >= g_mem && h < g_mem + 0x100000000ULL) ? (u32)(h - g_mem) : (u32)(uintptr_t)hp);
 }
+/* desktop GL: GLSL ES 1.00 -> GLSL 1.20 (precision qualifiers compiled out, ES-only lines dropped) */
+static char *gles_to_desktop(const GLchar *const *src, const GLint *lens, int n)
+{
+    size_t total = 128;
+    for (int i = 0; i < n; i++) total += (lens && lens[i] >= 0) ? (size_t)lens[i] : strlen(src[i]);
+    char *in = malloc(total), *out = malloc(total + 128), *q = in;
+    for (int i = 0; i < n; i++) {
+        size_t l = (lens && lens[i] >= 0) ? (size_t)lens[i] : strlen(src[i]);
+        memcpy(q, src[i], l);
+        q += l;
+    }
+    *q = 0;
+    char *o = out + sprintf(out, "#version 120\n#define lowp\n#define mediump\n#define highp\n");
+    for (char *line = in; *line; ) {
+        char *eol = strchr(line, '\n');
+        size_t len = eol ? (size_t)(eol - line + 1) : strlen(line);
+        const char *t = line;
+        while (*t == ' ' || *t == '\t') t++;
+        bool drop = !strncmp(t, "precision ", 10) || !strncmp(t, "#version", 8) ||
+                    (!strncmp(t, "#extension", 10) && (strstr(t, "GL_OES_") || strstr(t, "GL_EXT_shader_texture_lod")));
+        if (drop) *o++ = '\n';                             /* keep line numbers for compile logs */
+        else { memcpy(o, line, len); o += len; }
+        line += len;
+    }
+    *o = 0;
+    free(in);
+    return out;
+}
+
 static void h_glShaderSource(cpu_t *c)
 {
     GLsizei n = I(1);
@@ -301,6 +330,14 @@ static void h_glShaderSource(cpu_t *c)
             return;
         }
     }
+    if (g_gl_desktop) {
+        GLint hl[64];
+        for (GLsizei i = 0; i < n && lens; i++) hl[i] = (GLint)ld32(lens + 4 * i);
+        char *t = gles_to_desktop(hs, lens ? hl : NULL, n);
+        p_glShaderSource(A(0), 1, (const GLchar *const *)&t, NULL);
+        free(t);
+        return;
+    }
     p_glShaderSource(A(0), n, hs, lens ? g2h(lens) : NULL);
 }
 
@@ -322,6 +359,8 @@ static void h_glGetString(cpu_t *c)
 {
     GLenum name = A(0);
     const GLchar *s = p_glGetString(name);
+    if (g_gl_desktop && name == 0x1F02) s = "OpenGL ES 2.0 rr2emu (desktop GL)";   /* the game expects ES strings */
+    if (g_gl_desktop && name == 0x8B8C) s = "OpenGL ES GLSL ES 1.00";
     if (name == 0x1F03 && s) {                     /* advertise the ATC we emulate */
         static char *ext;
         if (!ext) {
@@ -815,10 +854,34 @@ float glhost_max_aniso(void)
 
 /* ---- setup ---- */
 
+static void (*p_glClearDepth)(double);
+static void (*p_glDepthRange)(double, double);
+static void es_ClearDepthf(GLfloat d) { p_glClearDepth(d); }
+static void es_DepthRangef(GLfloat a, GLfloat b) { p_glDepthRange(a, b); }
+static void es_ReleaseShaderCompiler(void) {}
+static void es_GetShaderPrecisionFormat(GLenum sh, GLenum type, GLint *range, GLint *prec)
+{
+    bool is_int = type >= 0x8DF3;                      /* LOW_INT.. */
+    range[0] = range[1] = is_int ? 31 : 127;
+    *prec = is_int ? 0 : 23;
+}
+/* desktop drivers without ARB_ES2_compatibility lack these; the rest of GLES2 is core GL 2.1 */
+static void *es_fallback(const char *n)
+{
+    *(void **)&p_glClearDepth = host_gl_proc("glClearDepth");
+    *(void **)&p_glDepthRange = host_gl_proc("glDepthRange");
+    if (!strcmp(n, "glClearDepthf") && p_glClearDepth) return (void *)es_ClearDepthf;
+    if (!strcmp(n, "glDepthRangef") && p_glDepthRange) return (void *)es_DepthRangef;
+    if (!strcmp(n, "glReleaseShaderCompiler")) return (void *)es_ReleaseShaderCompiler;
+    if (!strcmp(n, "glGetShaderPrecisionFormat")) return (void *)es_GetShaderPrecisionFormat;
+    return NULL;
+}
+
 bool glhost_init(void)
 {
 #define X(n, r, params, call) \
-    if (!(*(void **)&p_##n = host_gl_proc(#n))) { LOG("[gl] host lacks %s\n", #n); return false; }
+    if (!(*(void **)&p_##n = host_gl_proc(#n)) && !(g_gl_desktop && (*(void **)&p_##n = es_fallback(#n)))) \
+        { LOG("[gl] host lacks %s\n", #n); return false; }
     GL_PLAIN(X)
 #undef X
 #define H(n) if (!(*(void **)&p_##n = host_gl_proc(#n))) { LOG("[gl] host lacks %s\n", #n); return false; }
@@ -871,6 +934,10 @@ bool glhost_init(void)
     hle_register("glUnmapBufferOES", h_glUnmapBufferOES);
     hle_register("glGetBufferPointervOES", h_glGetBufferPointervOES);
     LOG("[gl] host: %s | %s | %s\n", p_glGetString(0x1F00), p_glGetString(0x1F01), p_glGetString(0x1F02));
+    if (g_gl_desktop) {                           /* GLES2 behaviour for gl_PointSize / gl_PointCoord */
+        p_glEnable(0x8642);
+        p_glEnable(0x8861);
+    }
     const char *ext = p_glGetString(0x1F03);
     g_s3tc = ext && strstr(ext, "GL_EXT_texture_compression_s3tc") && !getenv("RR2_NO_S3TC");
     LOG("[gl] ATC textures -> %s\n", g_s3tc ? "S3TC (transcoded, same size)" : "RGBA8 (decoded)");

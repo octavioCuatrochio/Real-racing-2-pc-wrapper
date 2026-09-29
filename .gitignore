@@ -1,6 +1,11 @@
 # build output
 *.o
 rr2emu
+rr2emu.exe
+build-win/
+dist/
+rr2emu.log
+*.dll
 
 # profiling / crash leftovers
 gmon.out

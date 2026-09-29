@@ -110,7 +110,7 @@ static void vfs_mkdirs(const char *path)
     for (char *p = tmp + 1; *p; p++) {
         if (*p == '/') {
             *p = 0;
-            mkdir(tmp, 0755);
+            emu_mkdir(tmp, 0755);
             *p = '/';
         }
     }
@@ -563,7 +563,9 @@ static void hle_fopen(cpu_t *c)
     int for_write = strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+');
     const char *host = vfs_xlate(GSTR(harg(c,0)), for_write);
     if (for_write) vfs_mkdirs(host);
-    FILE *f = fopen(host, mode);
+    char hmode[8];                                    /* Android stdio is always binary */
+    snprintf(hmode, sizeof(hmode), "%.6s%s", mode, strchr(mode, 'b') ? "" : "b");
+    FILE *f = fopen(host, hmode);
     VLOG(1, "[vfs] fopen(%s [%s]) -> %s = %p\n", GSTR(harg(c,0)), mode, host, (void *)f);
     free((void *)host);
     if (!f) { guest_errno_set(c, ENOENT); hret(c, 0); return; }
@@ -580,12 +582,14 @@ static void hle_fread(cpu_t *c)
 {
     FILE *f = file_for(harg(c,3));
     if (!f) { hret(c, 0); return; }
+    emu_prefault(g2h(harg(c,0)), (size_t)harg(c,1) * harg(c,2));
     hret(c, (u32)fread(g2h(harg(c,0)), harg(c,1), harg(c,2), f));
 }
 static void hle_fwrite(cpu_t *c)
 {
     FILE *f = file_for(harg(c,3));
     if (!f) { hret(c, 0); return; }
+    emu_prefault(g2h(harg(c,0)), (size_t)harg(c,1) * harg(c,2));
     hret(c, (u32)fwrite(g2h(harg(c,0)), harg(c,1), harg(c,2), f));
 }
 static void hle_fseek(cpu_t *c)
@@ -612,6 +616,7 @@ static void hle_fgets(cpu_t *c)
 {
     FILE *f = file_for(harg(c,2));
     if (!f) { hret(c, 0); return; }
+    emu_prefault(g2h(harg(c,0)), harg(c,1));
     char *r = fgets(g2h(harg(c,0)), (int)harg(c,1), f);
     hret(c, r ? harg(c,0) : 0);
 }
@@ -636,6 +641,9 @@ static void hle_perror(cpu_t *c)
     fprintf(stderr, "%s: %s\n", GSTR(harg(c,0)), strerror(guest_errno_get(c)));
 }
 static void hle_fwide(cpu_t *c) { hret(c, 0); }
+#ifdef _WIN32
+#define fsync _commit
+#endif
 static void hle_fsync(cpu_t *c)  { if ((int)harg(c,0) >= 0) fsync((int)harg(c,0)); hret(c, 0); }
 static void hle_ftruncate(cpu_t *c) { hret(c, (u32)ftruncate((int)harg(c,0), (off_t)(s32)harg(c,1))); }
 
@@ -705,10 +713,15 @@ static void hle_fscanf(cpu_t *c)
 
 static void hle_open(cpu_t *c)
 {
-    u32 gf = harg(c,1);
-    int flags = (int)(gf & 03777);                    /* access mode, creat/excl/trunc/append... */
-    if (gf & 0040000) flags |= O_DIRECTORY;           /* ARM values differ from x86-64 */
+    u32 gf = harg(c,1);                               /* ARM Linux O_* bits, rebuilt for the host */
+    int flags = (gf & 3) == 1 ? O_WRONLY : (gf & 3) == 2 ? O_RDWR : O_RDONLY;
+    if (gf & 0100) flags |= O_CREAT;
+    if (gf & 0200) flags |= O_EXCL;
+    if (gf & 01000) flags |= O_TRUNC;
+    if (gf & 02000) flags |= O_APPEND;
+    if (gf & 0040000) flags |= O_DIRECTORY;
     if (gf & 0100000) flags |= O_NOFOLLOW;
+    flags |= O_BINARY;
     int for_write = (flags & 3) != O_RDONLY || (flags & O_CREAT);
     const char *host = vfs_xlate(GSTR(harg(c,0)), for_write);
     if (for_write) vfs_mkdirs(host);
@@ -719,8 +732,8 @@ static void hle_open(cpu_t *c)
     hret(c, (u32)fd);
 }
 static void hle_close(cpu_t *c)  { hret(c, (u32)close((int)harg(c,0))); }
-static void hle_read(cpu_t *c)   { hret(c, (u32)read((int)harg(c,0), g2h(harg(c,1)), harg(c,2))); }
-static void hle_write(cpu_t *c)  { hret(c, (u32)write((int)harg(c,0), g2h(harg(c,1)), harg(c,2))); }
+static void hle_read(cpu_t *c)   { emu_prefault(g2h(harg(c,1)), harg(c,2)); hret(c, (u32)read((int)harg(c,0), g2h(harg(c,1)), harg(c,2))); }
+static void hle_write(cpu_t *c)  { emu_prefault(g2h(harg(c,1)), harg(c,2)); hret(c, (u32)write((int)harg(c,0), g2h(harg(c,1)), harg(c,2))); }
 static void hle_lseek(cpu_t *c)  { hret(c, (u32)lseek((int)harg(c,0), (off_t)(s32)harg(c,1), (int)harg(c,2))); }
 static void hle_fcntl(cpu_t *c)  { LOG_ONCE("[hle] fcntl stub\n"); hret(c, 0); }
 static void hle_ioctl(cpu_t *c)  { LOG_ONCE("[hle] ioctl stub\n"); hret(c, (u32)-1); }
@@ -762,8 +775,13 @@ void marshal_stat(gptr out, const struct stat *st)
     st32(out + 32, (u32)st->st_rdev);
     st32(out + 48, (u32)st->st_size);
     st32(out + 52, (u32)((u64)st->st_size >> 32));
+#ifdef _WIN32
+    st32(out + 56, 4096);
+    st32(out + 64, (u32)((st->st_size + 511) / 512));
+#else
     st32(out + 56, (u32)st->st_blksize);
     st32(out + 64, (u32)st->st_blocks);
+#endif
     st32(out + 72, (u32)st->st_atime);
     st32(out + 80, (u32)st->st_mtime);
     st32(out + 88, (u32)st->st_ctime);
@@ -793,7 +811,7 @@ static void hle_mkdir(cpu_t *c)
 {
     const char *host = vfs_xlate(GSTR(harg(c,0)), 1);
     vfs_mkdirs(host);
-    int r = mkdir(host, (mode_t)harg(c,1));
+    int r = emu_mkdir(host, (int)harg(c,1));
     free((void *)host);
     hret(c, (u32)r);
 }
@@ -822,7 +840,7 @@ static void hle_rename(cpu_t *c)
 {
     const char *a = vfs_xlate(GSTR(harg(c,0)), 1);
     const char *b = vfs_xlate(GSTR(harg(c,1)), 1);
-    int r = rename(a, b);
+    int r = emu_rename(a, b);
     free((void *)a); free((void *)b);
     hret(c, (u32)r);
 }
@@ -858,6 +876,7 @@ static void hle_statfs(cpu_t *c)
 /* directory reading: guest DIR* = index into table of host DIR* */
 #define MAX_GDIRS 16
 static DIR *g_dirs[MAX_GDIRS];
+static char *g_dir_paths[MAX_GDIRS];      /* host path, for d_type where the host has none */
 static int g_ndirs;
 
 static void hle_opendir(cpu_t *c)
@@ -865,10 +884,10 @@ static void hle_opendir(cpu_t *c)
     const char *host = vfs_xlate(GSTR(harg(c,0)), 0);
     DIR *d = opendir(host);
     VLOG(1, "[vfs] opendir(%s) -> %s = %p\n", GSTR(harg(c,0)), host, (void *)d);
-    free((void *)host);
-    if (!d) { guest_errno_set(c, ENOENT); hret(c, 0); return; }
-    if (g_ndirs >= MAX_GDIRS) { closedir(d); hret(c, 0); return; }
+    if (!d) { free((void *)host); guest_errno_set(c, ENOENT); hret(c, 0); return; }
+    if (g_ndirs >= MAX_GDIRS) { free((void *)host); closedir(d); hret(c, 0); return; }
     g_dirs[g_ndirs] = d;
+    g_dir_paths[g_ndirs] = (char *)host;
     hret(c, (u32)(++g_ndirs));   /* 1-based index */
 }
 static void hle_closedir(cpu_t *c)
@@ -878,7 +897,20 @@ static void hle_closedir(cpu_t *c)
     hret(c, 0);
 }
 /* Bionic dirent: u64 d_ino; long d_off; u16 d_reclen; u8 d_type; char d_name[256] */
-static u32 marshal_dirent(gptr out, const struct dirent *de)
+static u8 dirent_type(u32 id, const struct dirent *de)
+{
+#ifdef _WIN32
+    char p[1200];
+    struct stat st;
+    snprintf(p, sizeof(p), "%s/%s", g_dir_paths[id - 1], de->d_name);
+    if (stat(p, &st) != 0) return 0;                  /* DT_UNKNOWN */
+    return S_ISDIR(st.st_mode) ? 4 : 8;               /* DT_DIR / DT_REG */
+#else
+    (void)id;
+    return de->d_type;
+#endif
+}
+static u32 marshal_dirent(gptr out, const struct dirent *de, u8 type)
 {
     u32 reclen = 8 + 4 + 2 + 1 + 256;
     memset(g2h(out), 0, reclen);
@@ -886,7 +918,7 @@ static u32 marshal_dirent(gptr out, const struct dirent *de)
     st32(out + 4, 0);
     st32(out + 8, 0);               /* d_off */
     st16(out + 12, (u16)reclen);
-    st8(out + 14, de->d_type);
+    st8(out + 14, type);
     snprintf(g2h(out + 15), 256, "%s", de->d_name);
     return reclen;
 }
@@ -900,7 +932,7 @@ static void hle_readdir(cpu_t *c)
     struct dirent *de = readdir(g_dirs[id - 1]);
     if (!de) { pthread_mutex_unlock(&rd_lock); hret(c, 0); return; }
     if (!ent.buf) ent.buf = hle_data_alloc(512, 8);
-    marshal_dirent(ent.buf, de);
+    marshal_dirent(ent.buf, de, dirent_type(id, de));
     pthread_mutex_unlock(&rd_lock);
     hret(c, ent.buf);
 }
@@ -913,7 +945,7 @@ static void hle_readdir_r(cpu_t *c)
     pthread_mutex_lock(&rd2_lock);
     struct dirent *de = readdir(g_dirs[id - 1]);
     if (de) {
-        marshal_dirent(buf, de);
+        marshal_dirent(buf, de, dirent_type(id, de));
         st32(out, buf);
     } else {
         st32(out, 0);
@@ -985,7 +1017,11 @@ static void marshal_tm(gptr out, const struct tm *tm)
     st32(out + 24, (u32)tm->tm_wday);
     st32(out + 28, (u32)tm->tm_yday);
     st32(out + 32, (u32)tm->tm_isdst);
+#ifdef _WIN32
+    st32(out + 36, 0);
+#else
     st32(out + 36, (u32)tm->tm_gmtoff);
+#endif
     static gptr zone;
     if (!zone) { zone = hle_data_alloc(8, 4); strcpy(g2h(zone), "UTC"); }
     st32(out + 40, zone);

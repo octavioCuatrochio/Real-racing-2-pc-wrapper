@@ -1,6 +1,6 @@
 # Real Racing 2 PC wrapper (rr2emu)
 
-Run the Android version of **Real Racing 2** natively on Linux.
+Run the Android version of **Real Racing 2** natively on **Linux** and **Windows**.
 
 `rr2emu` is a small, performance-focused ARM user-mode emulator built for this one game. It loads the game's own native library (`libEAMRealRacing2.so`, armeabi / ARMv5 + VFP) and runs it with:
 
@@ -14,6 +14,19 @@ It boots to the menus, races with correct lighting, has input, audio and saving,
 
 > **Game files are not included.** You need your own copy of the Real Racing 2 APK and its data (OBB / cache zip).
 
+## Download
+
+Prebuilt packages are on the [Releases page](https://github.com/octavioCuatrochio/Real-racing-2-pc-wrapper/releases):
+
+| Package | Contents |
+|---|---|
+| `rr2emu-windows-x64.zip` | `rr2emu.exe`, `SDL2.dll`, this README. Unzip anywhere and run `rr2emu.exe`. |
+| `rr2emu-linux-x64.tar.gz` | the `rr2emu` binary and this README. Needs the runtime libraries listed below. |
+
+Every push is built and self-tested on Linux and on a real Windows machine by GitHub Actions; tags named `v*` publish a release.
+
+The Windows build isn't code-signed, so SmartScreen may warn on first run ("More info" → "Run anyway").
+
 ---
 
 ## Requirements
@@ -23,7 +36,7 @@ It boots to the menus, races with correct lighting, has input, audio and saving,
 | | Minimum | Tested on |
 |---|---|---|
 | CPU | x86-64 with SSE2 | AMD Ryzen APU (Raven Ridge) |
-| GPU | OpenGL ES 2.0 through the system driver (Mesa or vendor) | AMD Radeon Vega 8, Mesa 25.2 (radeonsi) |
+| GPU | OpenGL ES 2.0, or desktop OpenGL 2.1 (used automatically when the driver has no ES) | AMD Radeon Vega 8, Mesa 25.2 (radeonsi) |
 | RAM | ~1 GB free | |
 | Disk | ~1.5 GB for the unpacked game data | |
 
@@ -31,17 +44,18 @@ S3TC texture support (`GL_EXT_texture_compression_s3tc`, present on all desktop 
 
 ### Software
 
-Linux x86-64, tested on Ubuntu 24.04. All libraries are loaded at run time with `dlopen`, so **no `-dev` packages are needed to build**.
+**Windows:** Windows 10 or 11, 64-bit. Nothing to install: `SDL2.dll` ships in the zip and the launcher uses the system's Arial font. Rendering uses the GPU driver's OpenGL ES 2 context when it offers one (most NVIDIA and AMD drivers); drivers without one (often Intel iGPUs) get a desktop OpenGL 2.1 context with the game's shaders translated automatically.
+
+**Linux:** x86-64, tested on Ubuntu 24.04. All libraries are loaded at run time with `dlopen`, so **no `-dev` packages are needed to build**.
 
 | Library | Needed for | Ubuntu / Debian package |
 |---|---|---|
-| SDL2 (`libSDL2-2.0.so.0`) | window, GLES2 context, input, audio | `libsdl2-2.0-0` |
-| GLES2 / EGL driver | rendering | `libgles2`, `libegl1` (Mesa) |
-| zlib (`libz.so.1`) | unpacking the APK / OBB from the launcher | `zlib1g` |
+| SDL2 (`libSDL2-2.0.so.0`) | window, GL context, input, audio | `libsdl2-2.0-0` |
+| GLES2 / EGL or GL driver | rendering | `libgles2`, `libegl1` (Mesa) |
 | FreeType (`libfreetype.so.6`), optional | launcher text; falls back to a built-in pixel font | `libfreetype6` |
 | Nimbus Sans / Liberation Sans / DejaVu Sans, optional | launcher font | `fonts-urw-base35`, `fonts-liberation` or `fonts-dejavu-core` |
 
-To build you only need a C11 compiler and `make`, e.g. `build-essential`.
+The APK / OBB unpacking uses a built-in DEFLATE decoder, so zlib isn't needed on either platform.
 
 ### Game files
 
@@ -56,18 +70,28 @@ The in-game patches check every instruction word before changing it. On a differ
 
 ## Build
 
+You need a C11 compiler and `make` (e.g. `build-essential`).
+
+### Linux
+
 ```sh
 git clone https://github.com/octavioCuatrochio/Real-racing-2-pc-wrapper.git
 cd Real-racing-2-pc-wrapper
-make                 # produces ./rr2emu
+make                 # produces ./rr2emu, tuned for this CPU (-march=native)
 ./rr2emu --selftest  # CPU/VFP self-tests + interpreter/JIT fuzzing (should print "0 failed")
 ```
 
-The default flags use `-O2 -march=native`, so the binary is tuned for the machine that built it. For a portable binary, override them:
+`make release` builds a portable binary that runs on any x86-64 CPU. The JIT only emits baseline SSE2, so the only cost is the C code's own tuning.
+
+### Windows (cross-compiled from Linux)
+
+The Windows build uses [llvm-mingw](https://github.com/mstorsjo/llvm-mingw), a self-contained clang toolchain: unpack a release and put its `bin/` on `PATH`.
 
 ```sh
-make CFLAGS="-O2 -D_GNU_SOURCE -std=c11 -fno-strict-aliasing"
+make win WINCC=x86_64-w64-mingw32-clang   # produces rr2emu.exe (statically linked)
 ```
+
+Put [SDL2.dll](https://github.com/libsdl-org/SDL/releases) (the `win32-x64` zip) next to `rr2emu.exe`. The GitHub Actions workflow in `.github/workflows/build.yml` does exactly this and runs the self-test on Windows.
 
 Other targets: `make asan` (AddressSanitizer build; needs clang), `make clean`.
 
@@ -84,7 +108,7 @@ This opens the **launcher**:
 - **Game APK**: the `.apk` file, or a folder already extracted from it (containing `lib/armeabi/` and `assets/`).
 - **Game data (OBB)**: the OBB / cache `.zip`, or a folder containing `com.ea.game.realracing2_*/`.
 
-  Drag and drop files onto the window, or select the row, press Enter and type or paste (Ctrl+V) a path. Archives are unpacked once into `~/.cache/rr2emu/` and reused after that.
+  Drag and drop files onto the window, or select the row, press Enter and type or paste (Ctrl+V) a path. Archives are unpacked once into `~/.cache/rr2emu/` (Windows: `%LOCALAPPDATA%\rr2emu\`) and reused after that.
 - **Display**: resolution (up to your desktop size), fullscreen, anisotropic filtering (up to 16×) and VSync.
 - **Gameplay**:
   - **Disable assists**: forces steering assist, brake assist and anti-skid off.
@@ -92,9 +116,11 @@ This opens the **launcher**:
   - **Cockpit FOV**: −10° to +40° added to the interior camera. Above about +30° you start to see the edges of the car interior model.
 - **Controls**: remap every action. Each has two keyboard bindings and two controller bindings; sticks and triggers stay analog for steering and pedals.
 
-Every change is saved to `~/.config/rr2emu.cfg` right away, and **START** boots the game.
+Every change is saved to `~/.config/rr2emu.cfg` (Windows: `%APPDATA%\rr2emu\rr2emu.cfg`) right away, and **START** boots the game.
 
-**Save games** are written to `./save/` in the directory you run `rr2emu` from, so start it from the same place each time.
+**Save games** are written to `./save/` in the directory you run `rr2emu` from, so start it from the same place each time. On Windows that's the folder containing `rr2emu.exe` when you double-click it.
+
+On Windows, `rr2emu.exe` logs to `rr2emu.log` next to it, or to the console when started from one.
 
 ### In-game setup
 
@@ -154,8 +180,10 @@ Correctness is checked by `--selftest`, which fuzzes about 200k random instructi
 | `hle.c`, `hle_libc.c`, `hle_malloc.c`, `hle_sync.c` | Bionic libc, file system, malloc, pthreads |
 | `jni.c` | fake JavaVM/JNIEnv and the Java-side behaviour the game relies on |
 | `glhost.c`, `gles.c` | GLES2 passthrough to the host, and headless stubs |
-| `host.c` | SDL2 window, input and remapping, audio (loaded with `dlopen`) |
+| `host.c` | SDL2 window, GL context (ES or desktop fallback), input and remapping, audio (loaded with `dlopen`) |
 | `launcher.c` | the launcher UI, config file, APK / OBB unpacking |
+| `inflate.c` | DEFLATE decoder for the APK / OBB zips |
+| `platform.h`, `win32.c`, `win/` | the host differences: on Windows, lazily committed guest memory, `dlopen` / `pread` / `rename` shims, crash handling |
 | `patches.c` | optional game patches (assists, horizon tilt, cockpit FOV) |
 | `test.c` | self-tests and benchmark |
 | `NOTES.md` | developer notes: internals, debug switches, reverse-engineering findings |

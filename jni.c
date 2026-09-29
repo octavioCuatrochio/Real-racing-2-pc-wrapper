@@ -292,7 +292,7 @@ static u64 j_afd_fd(cpu_t *c, u32 self, jargs_t *a)
     jobj_t *o = jo(self);
     if (!o || !o->str) return 0;
     if (!o->data) {
-        int fd = open(o->str, O_RDONLY);
+        int fd = open(o->str, O_RDONLY | O_BINARY);
         u32 fdo = jnew_obj("java/io/FileDescriptor");
         u32 fid = field_new(jclass("java/io/FileDescriptor"), "descriptor", "I");
         pthread_mutex_lock(&jlock);
@@ -325,6 +325,7 @@ static u64 j_stream_read(cpu_t *c, u32 self, jargs_t *a)
     u32 arr = ja_i32(a), off = ja_i32(a), len = ja_i32(a);
     jobj_t *s = jo(self), *b = jo(arr);
     if (!s || !s->fp || !b || b->kind != K_ARR || off + len > b->len) return (u64)-1;
+    emu_prefault(g2h(b->data + off), len);
     size_t n = fread(g2h(b->data + off), 1, len, s->fp);
     return n ? (u32)n : (u32)-1;
 }
@@ -333,6 +334,7 @@ static u64 j_stream_read_all(cpu_t *c, u32 self, jargs_t *a)
     u32 arr = ja_i32(a);
     jobj_t *s = jo(self), *b = jo(arr);
     if (!s || !s->fp || !b || b->kind != K_ARR) return (u32)-1;
+    emu_prefault(g2h(b->data), b->len);
     size_t n = fread(g2h(b->data), 1, b->len, s->fp);
     return n ? (u32)n : (u32)-1;
 }

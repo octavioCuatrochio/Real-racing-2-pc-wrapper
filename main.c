@@ -42,7 +42,8 @@ void watch_rearm(cpu_t *c)
     watch_protect(watch_armed_prot());
 }
 
-/* --prof: CPU-time sampling of the main thread; buckets by JIT guest pc or host symbol */
+/* --prof: CPU-time sampling of the main thread; buckets by JIT guest pc or host symbol (Linux) */
+#ifndef _WIN32
 #include <dlfcn.h>
 #include <ucontext.h>
 #define PROF_N 8192
@@ -114,16 +115,22 @@ static void prof_report(void)
     }
 }
 
-static void on_segv(int sig, siginfo_t *si, void *uc)
+#else
+static void prof_start(void) { LOG("[prof] --prof is only available on Linux\n"); }
+static void prof_report(void) {}
+#endif
+
+/* a host memory fault: 1 = a watchpoint hit (retry the access), 0 = a crash (reported) */
+int emu_fault(void *addr)
 {
     cpu_t *c = tls_cpu;
-    u8 *a = si->si_addr;
+    u8 *a = addr;
     if (g_watch && c && a >= g_mem + (g_watch & ~4095u) && a < g_mem + (g_watch & ~4095u) + 4096) {
         watch_protect(PROT_READ | PROT_WRITE);   /* let the write through */
         if ((u32)(a - g_mem) - g_watch < 4) c->exit_loop |= EXIT_WATCH;
         else c->exit_loop |= EXIT_WATCH | 0x200;  /* same page, other address: re-arm silently */
         c->span = 0;                              /* next fetch takes the slow path */
-        return;
+        return 1;
     }
     if (a >= g_mem && a < g_mem + 0x100000000ULL)
         fprintf(stderr, "\n*** guest fault at guest addr %08x\n", (u32)(a - g_mem));
@@ -145,9 +152,17 @@ static void on_segv(int sig, siginfo_t *si, void *uc)
         for (int k = 0; k < 16; k++) fprintf(stderr, " %08x", c->ring[(c->ring_pos - k) & 63]);
         fprintf(stderr, "\n");
     }
+    return 0;
+}
+
+#ifndef _WIN32
+static void on_segv(int sig, siginfo_t *si, void *uc)
+{
+    if (emu_fault(si->si_addr)) return;
     signal(SIGSEGV, SIG_DFL);
     abort();
 }
+#endif
 
 static void dump_threads(int sig)
 {
@@ -265,6 +280,9 @@ static void touch_ptr(int id, int action, int x, int y)
 
 int main(int argc, char **argv)
 {
+#ifdef _WIN32
+    win_init();
+#endif
     const char *so_path = NULL;
     int do_selftest = 0, do_prof = 0, no_launcher = 0;
     G.assets_dir = "./assets";
@@ -324,9 +342,11 @@ int main(int argc, char **argv)
         else usage(argv[0]);
     }
 
+#ifndef _WIN32
     struct sigaction sa = { .sa_sigaction = on_segv, .sa_flags = SA_SIGINFO };
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
+#endif
     signal(SIGINT, dump_threads);
     signal(SIGTERM, dump_threads);
     host_binds_default();
@@ -470,6 +490,7 @@ int main(int argc, char **argv)
             if (cam_t == 3) touch_ptr(3, 1, cam_x, cam_y);
             if (++cam_t == 6) { cam_taps--; cam_t = 0; }
         }
+        while (backs_sent < g_input.back) { send_key(4, 1); send_key(4, 0); backs_sent++; }
         u32 vid = jni_take_video_completion();          /* deliver VideoPlayer onCompletion */
         if (vid && g_video_done_fn) { u32 va[2] = { jni_env_ptr(), vid }; emu_call(c, g_video_done_fn, 2, va); }
         for (int t = 0; t < g_nholds; t++) {

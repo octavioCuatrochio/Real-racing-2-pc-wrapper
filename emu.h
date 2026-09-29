@@ -15,6 +15,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <pthread.h>
+#include "platform.h"
 #include <math.h>
 
 typedef uint8_t  u8;
@@ -147,7 +148,7 @@ extern handler_t dec_table[4096];      /* generic handlers: the reference implem
 
 /* pre-decoded instruction cache (dec.c): one di_t per text word */
 typedef struct di di_t;
-typedef void (*dfn_t)(cpu_t *c, const di_t *d);
+typedef void (JITCALL *dfn_t)(cpu_t *c, const di_t *d);
 struct di {
     dfn_t h;
     u32   insn;
@@ -278,6 +279,7 @@ void gles_tick_frame(void); /* FPS meter hook from eglSwapBuffers-equivalents */
 /* host window / GL (host.c, glhost.c) */
 typedef void (*host_input_fn)(int action, int x, int y);   /* 0 down, 1 up, 2 move */
 bool  host_video_init(int w, int h, int vsync);
+extern int g_gl_desktop;                 /* 1: desktop GL context, GLSL ES translated */
 void *host_gl_proc(const char *name);
 bool  host_present(void);
 void  host_swap(void);
@@ -297,6 +299,7 @@ void  host_text_input(int on);
 float glhost_max_aniso(void);
 bool  launcher_run(const char **so_path);
 void  patches_setup(void);
+int   inflate_raw(const u8 *in, size_t n, u8 *out, size_t outn);
 void  patch_svc(cpu_t *c, u32 id);
 typedef struct { float steer_target; int gas, brake; int back, camera; } host_input_t;
 extern volatile int g_hide_next_tex;     /* set by the VFS when a HUD image is opened: 1 hidden, 2 race marker */

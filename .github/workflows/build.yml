@@ -1,0 +1,84 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  LLVM_MINGW: "20260922"
+  SDL2_VERSION: "2.32.10"
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make release
+      - name: Self-test
+        run: ./rr2emu --selftest
+      - name: Package
+        run: |
+          mkdir -p dist/rr2emu-linux-x64
+          cp rr2emu README.md dist/rr2emu-linux-x64/
+          tar -C dist -czf rr2emu-linux-x64.tar.gz rr2emu-linux-x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rr2emu-linux-x64
+          path: rr2emu-linux-x64.tar.gz
+
+  windows-build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (llvm-mingw)
+        run: |
+          curl -fsSL -o llvm-mingw.tar.xz "https://github.com/mstorsjo/llvm-mingw/releases/download/$LLVM_MINGW/llvm-mingw-$LLVM_MINGW-ucrt-ubuntu-22.04-x86_64.tar.xz"
+          tar xf llvm-mingw.tar.xz
+          echo "$PWD/llvm-mingw-$LLVM_MINGW-ucrt-ubuntu-22.04-x86_64/bin" >> "$GITHUB_PATH"
+      - name: Build
+        run: make win WINCC=x86_64-w64-mingw32-clang
+      - name: Package (with SDL2.dll)
+        run: |
+          curl -fsSL -o sdl2.zip "https://github.com/libsdl-org/SDL/releases/download/release-$SDL2_VERSION/SDL2-$SDL2_VERSION-win32-x64.zip"
+          mkdir -p dist/rr2emu-windows-x64
+          unzip -o sdl2.zip SDL2.dll README-SDL.txt -d dist/rr2emu-windows-x64
+          cp rr2emu.exe README.md dist/rr2emu-windows-x64/
+          (cd dist && zip -r ../rr2emu-windows-x64.zip rr2emu-windows-x64)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rr2emu-windows-x64
+          path: rr2emu-windows-x64.zip
+
+  windows-test:
+    needs: windows-build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rr2emu-windows-x64
+      - name: Self-test on Windows
+        shell: pwsh
+        run: |
+          Expand-Archive rr2emu-windows-x64.zip -DestinationPath .
+          $p = Start-Process -FilePath .\rr2emu-windows-x64\rr2emu.exe -ArgumentList '--selftest' -Wait -PassThru -NoNewWindow
+          if (Test-Path .\rr2emu-windows-x64\rr2emu.log) { Get-Content .\rr2emu-windows-x64\rr2emu.log }
+          if ($p.ExitCode -ne 0) { exit 1 }
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            rr2emu-linux-x64/rr2emu-linux-x64.tar.gz
+            rr2emu-windows-x64/rr2emu-windows-x64.zip
+          generate_release_notes: true

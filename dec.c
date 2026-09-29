@@ -17,7 +17,7 @@ static u32 icache_lo, icache_words;
 u16 cond_tab[16];
 u16 condx_tab[16];
 
-void d_decode(cpu_t *c, const di_t *d);
+JITCALL void d_decode(cpu_t *c, const di_t *d);
 
 static const dfn_t op_fns[OP_COUNT] = {
     [OP_decode] = d_decode, [OP_generic] = NULL, [OP_hook] = NULL,   /* set in decode_into */
@@ -52,7 +52,7 @@ int g_stats;
 static u64 generic_hits[4096];
 static u32 generic_example[4096];
 
-void d_generic(cpu_t *c, const di_t *d)
+JITCALL void d_generic(cpu_t *c, const di_t *d)
 {
     if (__builtin_expect(g_stats, 0)) {
         u32 k = DEC_KEY(d->insn);
@@ -91,7 +91,7 @@ static u32 hook_pcs[8];
 static int nhooks;
 void cpu_add_hook(u32 pc) { if (nhooks < 8) hook_pcs[nhooks++] = pc; }
 
-void d_hook(cpu_t *c, const di_t *d)
+JITCALL void d_hook(cpu_t *c, const di_t *d)
 {
     u32 pc = c->r[15] - 4;
     LOG("[hook] %08x:", pc);
@@ -410,7 +410,7 @@ done:
     d->h = op == OP_generic ? d_generic : op == OP_hook ? d_hook : op_fns[op];
 }
 
-void d_decode(cpu_t *c, const di_t *d)
+JITCALL void d_decode(cpu_t *c, const di_t *d)
 {
     di_t *w = (di_t *)d;
     u32 pc = c->r[15] - 4;

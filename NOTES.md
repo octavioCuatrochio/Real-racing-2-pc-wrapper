@@ -65,6 +65,25 @@ Pedals are touch zones (gas bottom-right, brake bottom-left); their HUD images a
 - Toggles: RR2_NO_S3TC, RR2_NO_GLCACHE, RR2_JIT_SAFEFLAGS, RR2_AUDIO_RATE=22050 (cheaper mixer).
 - Measure with --prof (main-thread samples, RR2_PROF_DUMP=file for raw buckets).
 
+## Windows port
+- Build: `make win WINCC=x86_64-w64-mingw32-clang` (llvm-mingw), static, GUI subsystem; needs SDL2.dll.
+- JIT ABI: generated code and its C callees use System V (`JITCALL` = `__attribute__((sysv_abi))` on
+  dfn_t handlers, d_generic/d_hook/d_decode, jit_hle_call and the entry stub), so jit.c is unchanged.
+- Memory: win/sys/mman.h shims reserve with VirtualAlloc; a vectored exception handler commits 64 KB
+  on first touch (Linux MAP_NORESERVE semantics), madvise(DONTNEED) decommits. The kernel does NOT
+  fault pages in during I/O (ReadFile into an uncommitted page just fails), so host I/O on guest memory
+  calls emu_prefault() first (read/write/fread/fwrite/fgets/pread/asset reads). Missing that made a
+  texture read fail and the game allocate 618 MB from a garbage header.
+- GL: SDL asks for GLES2; without WGL_EXT_create_context_es2_profile it falls back to a desktop GL 2.1
+  context (RR2_GL=desktop|es forces) and glhost rewrites GLSL ES to `#version 120` (precision
+  qualifiers defined away, ES-only #extension lines dropped), reports ES version strings, enables
+  program point size / point sprites, and emulates glClearDepthf/glDepthRangef if needed.
+- Files: guest O_* bits are rebuilt for the host (+O_BINARY), guest fopen modes get "b", d_type comes
+  from stat, rename replaces existing targets, stat's blksize/blocks are synthesized.
+- Launcher: GDI rasterizes Arial; config in %APPDATA%\rr2emu, cache in %LOCALAPPDATA%\rr2emu.
+- timeBeginPeriod(1) so the game's 1 ms sleeps don't round to 15.6 ms. --prof is Linux-only.
+- Tested with Wine 11.18: selftest passes; the game boots and renders through the desktop GL path.
+
 ## Debug tools
 `--hook PC` logs registers when a guest PC executes (RR2_HOOK_DUMP=reg:off dumps memory),
 `--watch ADDR` logs writes, `--stats` shows generic-path instruction mix.

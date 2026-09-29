@@ -285,7 +285,8 @@ static void hle_mmap(cpu_t *c)
     u32 offset = harg(c, 5);
     gptr a = guest_mmap_pages((len + 4095) / 4096);
     if (!a) { hret(c, (u32)-1); return; }
-    if (fd >= 0 && pread(fd, g2h(a), len, offset) < 0)
+    if (fd >= 0) emu_prefault(g2h(a), len);
+    if (fd >= 0 && emu_pread(fd, g2h(a), len, offset) < 0)
         VLOG(1, "[hle] mmap fd=%d read failed\n", fd);
     hret(c, a);
 }

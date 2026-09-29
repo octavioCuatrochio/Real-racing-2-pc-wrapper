@@ -17,7 +17,7 @@
 #define JIT_CACHE      (64u << 20)
 #define JIT_MAX_INSNS  64
 
-typedef void (*jit_entry_t)(cpu_t *c, u8 *mem, void *code);
+typedef void (JITCALL *jit_entry_t)(cpu_t *c, u8 *mem, void *code);
 
 static u8  *jc_base, *jc_ptr, *jc_end;
 static void **jit_table;                 /* per text word: block code or NULL */
@@ -30,7 +30,7 @@ static pthread_mutex_t jit_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool  jit_full;
 int g_jit = 1;
 
-void d_generic(cpu_t *c, const di_t *d);
+JITCALL void d_generic(cpu_t *c, const di_t *d);
 
 /* ------------------------------------------------------------------ */
 /* x86-64 emitter                                                      */
@@ -943,7 +943,7 @@ bool jit_owns(const void *host) { return jc_base && (const u8 *)host >= jc_base 
 
 /* called from JIT code for a branch into an HLE slot: 0 = keep running, 1 = leave the JIT */
 bool hle_divert(cpu_t *c, u32 pc);
-static u32 jit_hle_call(cpu_t *c)
+static JITCALL u32 jit_hle_call(cpu_t *c)
 {
     if (hle_divert(c, c->r[15])) return 1;
     return c->exit_loop != 0;
