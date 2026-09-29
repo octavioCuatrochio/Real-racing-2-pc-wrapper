@@ -454,6 +454,9 @@ bool host_audio_open(int rate, int channels)
 
 void host_audio_write(const void *pcm, u32 bytes)
 {
+    static FILE *dump; static int dump_init;                /* RR2_AUDIO_DUMP=file: raw s16le PCM as played */
+    if (!dump_init) { dump_init = 1; if (getenv("RR2_AUDIO_DUMP")) dump = fopen(getenv("RR2_AUDIO_DUMP"), "wb"); }
+    if (dump) fwrite(pcm, 1, bytes, dump);
     if (!g_adev) {                                 /* headless: pace like a real device would */
         usleep((useconds_t)((u64)bytes * 1000000 / g_abytes_per_sec));
         return;

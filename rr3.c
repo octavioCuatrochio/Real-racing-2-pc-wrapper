@@ -132,11 +132,31 @@ static void patch_scene_scale(void)
     LOG("[rr3] 3D scene at native resolution\n");
 }
 
+/* /proc/cpuinfo as the emulated phone (MSM8998, 32-bit view): FMOD's init reads the Features line
+ * and fails without the file. Written into the save overlay, which the VFS reads first. */
+static void write_cpuinfo(void)
+{
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/other/proc", G.save_dir);
+    for (char *q = path + 1; *q; q++) if (*q == '/') { *q = 0; emu_mkdir(path, 0755); *q = '/'; }
+    emu_mkdir(path, 0755);
+    strcat(path, "/cpuinfo");
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    for (int i = 0; i < 4; i++)
+        fprintf(f, "processor\t: %d\nBogoMIPS\t: 38.40\n"
+                   "Features\t: half thumb fastmult vfp edsp neon vfpv3 tls vfpv4 idiva idivt lpae evtstrm aes pmull sha1 sha2 crc32\n"
+                   "CPU implementer\t: 0x51\nCPU architecture: 8\nCPU variant\t: 0xa\nCPU part\t: 0x801\nCPU revision\t: 4\n\n", i);
+    fprintf(f, "Hardware\t: Qualcomm Technologies, Inc MSM8998\n");
+    fclose(f);
+}
+
 int rr3_main(const char *so_path)
 {
     G.game = 3;
     if (!G.save_dir) G.save_dir = "./save_rr3";
     LOG("[rr3] loading %s (data %s, saves %s)\n", so_path, G.assets_dir, G.save_dir);
+    write_cpuinfo();
     if (elf_load(&G, so_path) != 0) fatal("failed to load %s", so_path);
     if (getenv("RR2_STUBS")) { extern void hle_dump_stubs(void); hle_dump_stubs(); }
     patch_scene_scale();
