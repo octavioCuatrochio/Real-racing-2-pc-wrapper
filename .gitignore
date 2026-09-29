@@ -1,0 +1,21 @@
+# build output
+*.o
+rr2emu
+
+# profiling / crash leftovers
+gmon.out
+core
+core.*
+perf.data*
+
+# game saves written at runtime (./save relative to the working directory)
+save/
+
+# debug captures
+*.png
+*.bin
+
+# game files are never committed (APK, OBB/cache zip, extracted data)
+*.apk
+*.obb
+*.zip
