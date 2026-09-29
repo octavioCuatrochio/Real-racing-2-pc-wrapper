@@ -932,6 +932,81 @@ static void test_fuzz_blocks(cpu_t *c)
     CHECK(bad == 0 && tested > 20000);
 }
 
+/* NEON/VFP/core mixed blocks: exercises the q-register cache (stores through other paths must drop it) */
+static u32 gen_neon(void)
+{
+    u32 regs3 = fz() & 0x004FF0AFu;
+    switch (fz() % 6) {
+    case 0: return 0xF2000D00u | (fz() & 1) << 24 | (fz() & 1) << 21 | (fz() & 1) << 6 | (fz() & 1) << 4 | regs3;
+    case 1: { static const u32 A[3] = { 1, 5, 9 }; return 0xF2A00040u | (fz() & 1) << 24 | A[fz() % 3] << 8 | (fz() & 0x004FF02Fu); }
+    case 2: return 0xF2000110u | (fz() & 1) << 24 | (fz() & 3) << 20 | (fz() & 1) << 6 | regs3;
+    case 3: return 0xF2800010u | (fz() & 0x01470F6Fu);
+    default: return ((0xF4000000u | (fz() & 0x00EFFFFFu)) & ~0x000F0000u) | 12u << 16;   /* base r12 */
+    }
+}
+static void test_fuzz_neon_blocks(cpu_t *c)
+{
+    enum { MEM = 0x3000, N = 10 };
+    static u8 mem0[MEM], mem1[MEM];
+    const u32 pc = TBASE + 0x600;
+    int tested = 0, bad = 0;
+    for (int it = 0; it < 30000 && bad < 6; it++) {
+        u32 code[N];
+        for (int k = 0; k < N; ) {
+            u32 insn, r = fz() % 10;
+            if (r < 6) insn = gen_neon();
+            else if (r < 8) insn = 0xE0000000u | ((fz() & 1) ? 0x0C000000u : 0x0E000000u) | (fz() & 0x01FFF0FFu) | ((10u + (fz() & 1)) << 8);
+            else insn = 0xE0000000u | (fz() & 0x01FFFFFFu);
+            u32 cls = (insn >> 25) & 7;
+            if ((insn >> 28) == 0xF) {                        /* NEON: native forms; loads/stores off r12, fixed stride */
+                if (!jit_neon_covers(insn)) continue;
+                if ((insn >> 24) == 0xF4 && (insn & 0xF) < 13) continue;
+            } else if (cls == 6) {                            /* only vmov r, r <-> d / s pair */
+                if ((insn & 0x0FE000D0u) != 0x0C400010u || ((insn >> 12) & 0xF) >= 12 || ((insn >> 16) & 0xF) >= 12) continue;
+                if (!jit_arm7_covers(insn)) continue;
+            } else if (cls == 7) {
+                di_t d;
+                if (!cpu_decode_one(&d, pc, insn) && !jit_arm7_covers(insn)) continue;
+                if ((insn & 0x10) && ((insn >> 12) & 0xF) >= 12 && ((insn >> 12) & 0xF) != 15) continue;   /* vmov r12+ */
+            } else if (!seq_ok(insn)) continue;
+            code[k++] = insn;
+        }
+        u32 r0[16], v0[64];
+        for (int i = 0; i < 12; i++) r0[i] = fz() & 0xFF;
+        r0[12] = TDATA + 0x800 + (fz() & 0x3F0); r0[13] = TDATA + 0x1800; r0[14] = 0; r0[15] = 0;
+        for (int i = 0; i < 64; i++) v0[i] = fz_float();
+        for (int i = 0; i < MEM; i++) mem0[i] = (u8)fz();
+
+        memcpy(c->r, r0, sizeof(r0)); c->cpsr = 0; memcpy(c->v.w, v0, sizeof(v0)); c->fpscr = 0;
+        memcpy(g2h(TDATA), mem0, MEM);
+        for (int k = 0; k < N; k++) {
+            c->r[15] = pc + 4 * k + 4;
+            u32 w = code[k];
+            if ((w >> 24) == 0xF4) neon_ls(c, w);
+            else if ((w >> 25) == 0x79) neon_dp(c, w);
+            else dec_table[DEC_KEY(w)](c, w);
+        }
+        u32 rg[16], vg[64], fg = c->fpscr; memcpy(rg, c->r, sizeof(rg)); memcpy(vg, c->v.w, sizeof(vg)); memcpy(mem1, g2h(TDATA), MEM);
+
+        memcpy(c->r, r0, sizeof(r0)); c->cpsr = 0; memcpy(c->v.w, v0, sizeof(v0)); c->fpscr = 0;
+        memcpy(g2h(TDATA), mem0, MEM);
+        if (!jit_test_seq(c, pc, code, N)) continue;
+        tested++;
+        if (memcmp(rg, c->r, 15 * 4) || memcmp(vg, c->v.w, sizeof(vg)) || memcmp(mem1, g2h(TDATA), MEM) || fg != c->fpscr) {
+            bad++;
+            LOG("NEON BLOCK mismatch:");
+            for (int k = 0; k < N; k++) LOG(" %08x", code[k]);
+            LOG("\n ");
+            for (int i = 0; i < 15; i++) if (rg[i] != c->r[i]) LOG(" r%d %08x vs %08x", i, rg[i], c->r[i]);
+            for (int i = 0; i < 64; i++) if (vg[i] != c->v.w[i]) LOG(" s%d %08x vs %08x", i, vg[i], c->v.w[i]);
+            if (fg != c->fpscr) LOG(" fpscr %08x vs %08x", fg, c->fpscr);
+            LOG("%s\n", memcmp(mem1, g2h(TDATA), MEM) ? " (memory differs)" : "");
+        }
+    }
+    LOG("[selftest] neon block fuzz: %d blocks of %d compared, %d mismatches\n", tested, N, bad);
+    CHECK(bad == 0 && tested > 15000);
+}
+
 int selftest_main(void)
 {
     cpu_t *c = emu_new_cpu();
@@ -958,6 +1033,7 @@ int selftest_main(void)
     test_fuzz_fused(c);
     test_fuzz_neon_jit(c);
     test_fuzz_blocks(c);
+    test_fuzz_neon_blocks(c);
 
     LOG("[selftest] %d passed, %d failed\n", passes, fails);
     return fails ? 1 : 0;

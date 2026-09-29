@@ -49,9 +49,12 @@ static inline void rex(int w, int r, int x, int b, bool force)
     u8 v = 0x40 | (w << 3) | ((r >> 3) << 2) | ((x >> 3) << 1) | (b >> 3);
     if (v != 0x40 || force) e8(v);
 }
+static void vc_drop_off(s32 disp, int bytes);
 /* op reg, [rbx + disp32] */
 static void mrm_rbx(int w, const u8 *op, int nop, int reg, s32 disp)
 {
+    if (nop == 1 && (op[0] == 0x88 || op[0] == 0x89)) vc_drop_off(disp, w ? 8 : 4);
+    if (nop == 2 && op[0] == 0x0F && (op[1] == 0x11 || op[1] == 0x29 || op[1] == 0xD6)) vc_drop_off(disp, 16);
     rex(w, reg, 0, RBX, false);
     for (int i = 0; i < nop; i++) e8(op[i]);
     e8(0x80 | ((reg & 7) << 3) | (RBX & 7));
@@ -93,7 +96,8 @@ static void mov_rr(int d, int s)  { static const u8 o[] = { 0x89 }; mrm_rr(0, o,
 static const int rc_host[RC_N] = { R12, R13, R14, RBP };
 static int rc_greg[RC_N] = { -1, -1, -1, -1 };
 static unsigned rc_stamp[RC_N], rc_clock;
-static void rc_reset(void) { for (int i = 0; i < RC_N; i++) rc_greg[i] = -1; }
+static void vc_reset(void);
+static void rc_reset(void) { for (int i = 0; i < RC_N; i++) rc_greg[i] = -1; vc_reset(); }
 static int rc_greg_of(s32 off)
 {
     s32 d = off - (s32)offsetof(cpu_t, r);
@@ -113,9 +117,46 @@ static int rc_take(int g)
     rc_greg[i] = g; rc_stamp[i] = ++rc_clock;
     return i;
 }
-typedef struct { int g[RC_N]; unsigned st[RC_N]; } rc_snap_t;     /* for code that is emitted, then rolled back */
-static rc_snap_t rc_save(void) { rc_snap_t v; memcpy(v.g, rc_greg, sizeof(v.g)); memcpy(v.st, rc_stamp, sizeof(v.st)); return v; }
-static void rc_restore(const rc_snap_t *v) { memcpy(rc_greg, v->g, sizeof(v->g)); memcpy(rc_stamp, v->st, sizeof(v->st)); }
+/* NEON q registers the same way, in xmm8-xmm15. Every store into cpu_t.v other than st_vec's
+ * drops the entries it overlaps (hooked in mrm_rbx / st_imm). */
+#define VC_N 8
+static int vc_q[VC_N] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+static unsigned vc_stamp[VC_N], vc_clock;
+static void vc_reset(void) { for (int i = 0; i < VC_N; i++) vc_q[i] = -1; }
+static void vc_drop_off(s32 disp, int bytes)
+{
+    s32 lo = disp - (s32)offsetof(cpu_t, v), hi = lo + bytes - 1;
+    if (hi < 0 || lo >= 256) return;
+    for (int i = 0; i < VC_N; i++) if (vc_q[i] >= 0 && vc_q[i] * 16 <= hi && vc_q[i] * 16 + 15 >= lo) vc_q[i] = -1;
+}
+static int vc_find(int q)
+{
+    for (int i = 0; i < VC_N; i++) if (vc_q[i] == q) { vc_stamp[i] = ++vc_clock; return i; }
+    return -1;
+}
+static int vc_take(int q)
+{
+    int i = vc_find(q);
+    if (i >= 0) return i;
+    i = 0;
+    for (int k = 1; k < VC_N; k++) if (vc_q[k] < 0 || (vc_q[i] >= 0 && vc_stamp[k] < vc_stamp[i])) i = k;
+    vc_q[i] = q; vc_stamp[i] = ++vc_clock;
+    return i;
+}
+
+typedef struct { int g[RC_N]; unsigned st[RC_N]; int q[VC_N]; unsigned qs[VC_N]; } rc_snap_t;   /* emitted, then rolled back */
+static rc_snap_t rc_save(void)
+{
+    rc_snap_t v;
+    memcpy(v.g, rc_greg, sizeof(v.g)); memcpy(v.st, rc_stamp, sizeof(v.st));
+    memcpy(v.q, vc_q, sizeof(v.q)); memcpy(v.qs, vc_stamp, sizeof(v.qs));
+    return v;
+}
+static void rc_restore(const rc_snap_t *v)
+{
+    memcpy(rc_greg, v->g, sizeof(v->g)); memcpy(rc_stamp, v->st, sizeof(v->st));
+    memcpy(vc_q, v->q, sizeof(v->q)); memcpy(vc_stamp, v->qs, sizeof(v->qs));
+}
 static void rc_drop(int g) { for (int i = 0; i < RC_N; i++) if (rc_greg[i] == g) rc_greg[i] = -1; }
 
 static void ld_r(int x, s32 off)                                    /* mov x32,[rbx+off] */
@@ -134,6 +175,7 @@ static void st_r(int x, s32 off)                                    /* mov [rbx+
 static void st_imm(s32 off, u32 v)
 {
     rex(0, 0, 0, RBX, false); e8(0xC7); e8(0x83); e32((u32)off); e32(v);
+    vc_drop_off(off, 4);
     int g = rc_greg_of(off);
     if (g >= 0) mov_ri(rc_host[rc_take(g)], v);
 }
@@ -285,6 +327,8 @@ static void patch_side_exits(int total)
 }
 /* a forward jump over code that always leaves the block: nothing merges, keep the cache */
 static void patch32_over_exit(u8 *at) { s32 rel = (s32)(p - (at + 4)); memcpy(at, &rel, 4); }
+/* same, for skipped code that leaves both caches as they were */
+#define patch32_keep patch32_over_exit
 
 static void flush_slots(void)
 {
@@ -779,8 +823,20 @@ static void x_mem(u8 pfx, u8 op, int x, int idx)
     e8(0x0F); e8(op); e8(0x04 | ((x & 7) << 3)); e8(((idx & 7) << 3) | (R15 & 7));
 }
 static void x_shi(u8 ext, int x, u8 n) { e8(0x66); e8(0x0F); e8(0x72); e8(0xC0 | (ext << 3) | (x & 7)); e8(n); }   /* psrld/pslld */
-static void ld_vec(int x, u32 reg, bool q) { if (q) x_rbx(0, 0x10, x, OFF_D(reg)); else x_rbx(0xF3, 0x7E, x, OFF_D(reg)); }
-static void st_vec(int x, u32 reg, bool q) { if (q) x_rbx(0, 0x11, x, OFF_D(reg)); else x_rbx(0x66, 0xD6, x, OFF_D(reg)); }
+static void ld_vec(int x, u32 reg, bool q)
+{
+    if (!q) { x_rbx(0xF3, 0x7E, x, OFF_D(reg)); return; }
+    int i = vc_find((int)reg >> 1);
+    if (i >= 0) { x_rr(0, 0x28, x, 8 + i); return; }               /* movaps x, cached */
+    x_rbx(0, 0x10, x, OFF_D(reg));
+    x_rr(0, 0x28, 8 + vc_take((int)reg >> 1), x);
+}
+static void st_vec(int x, u32 reg, bool q)
+{
+    if (!q) { x_rbx(0x66, 0xD6, x, OFF_D(reg)); return; }
+    x_rbx(0, 0x11, x, OFF_D(reg));
+    x_rr(0, 0x28, 8 + vc_take((int)reg >> 1), x);
+}
 static void and64_rr(int d, int s) { static const u8 o[] = { 0x21 }; mrm_rr(1, o, 1, s, d, false); }
 
 enum { NF_NONE, NF_ADD, NF_SUB, NF_MUL, NF_MLA, NF_MLS };
@@ -832,13 +888,17 @@ static bool emit_neon_float(u32 insn)
         r = 1;
         break;
     }
-    /* NaN lanes -> default NaN 0x7FC00000 */
+    /* NaN lanes -> default NaN 0x7FC00000 (rare: branch around the fix) */
     x_rr(0, 0x28, 2, r); x_rr(0, 0xC2, 2, 2); e8(3);               /* xmm2 = unord(r, r) */
+    x_rr(0, 0x50, RAX, 2); test_rr(RAX, RAX);                      /* movmskps eax, xmm2 */
+    u8 *clean = jcc32(CC_E);
     x_rr(0x66, 0x76, 3, 3); x_shi(2, 3, 23); x_shi(6, 3, 22);       /* xmm3 = 0x7FC00000 */
     x_rr(0, 0x54, 3, 2);                                           /* andps 3, 2 */
     x_rr(0, 0x55, 2, r);                                           /* andnps 2, r */
     x_rr(0, 0x56, 2, 3);                                           /* orps 2, 3 */
-    st_vec(2, d, q);
+    x_rr(0, 0x28, r, 2);
+    patch32_keep(clean);
+    st_vec(r, d, q);
     return true;
 }
 
@@ -912,8 +972,8 @@ static bool emit_neon_ls(u32 insn)
         for (u32 i = 0; i < regs; ) {
             if (off) alu_ri(0, RCX, off), off = 0;
             if (regs - i >= 2) {
-                if (L) { x_mem(0, 0x10, 0, RCX); x_rbx(0, 0x11, 0, OFF_D(d + i)); }
-                else { x_rbx(0, 0x10, 0, OFF_D(d + i)); x_mem(0, 0x11, 0, RCX); }
+                if (L) { x_mem(0, 0x10, 0, RCX); if (!((d + i) & 1)) st_vec(0, d + i, true); else x_rbx(0, 0x11, 0, OFF_D(d + i)); }
+                else { if (!((d + i) & 1)) ld_vec(0, d + i, true); else x_rbx(0, 0x10, 0, OFF_D(d + i)); x_mem(0, 0x11, 0, RCX); }
                 i += 2; off = 16;
             } else {
                 if (L) { gld64(RAX, RCX); st64_rbx(RAX, OFF_D(d + i)); }
@@ -930,6 +990,13 @@ static bool emit_neon_ls(u32 insn)
         u32 s2 = (insn >> 6) & 3, T = (insn >> 5) & 1;
         if (!L || s2 == 3 || d + T >= 32) return false;
         ld_r(RCX, OFF_R(rn));
+        if (s2 == 2 && T && !(d & 1)) {                             /* vld1.32 {dN[], dN+1[]}: straight into q */
+            gld32(RAX, RCX); movd_x_r(0, RAX);
+            e8(0x66); e8(0x0F); e8(0x70); e8(0xC0); e8(0x00);       /* pshufd xmm0, xmm0, 0 */
+            st_vec(0, d, true);
+            neon_writeback(rn, rm, 4);
+            return true;
+        }
         if (s2 == 0) { gldu8(RAX, RCX); rex(0, RAX, 0, RAX, false); e8(0x69); e8(0xC0); e32(0x01010101u); }
         else if (s2 == 1) { gldu16(RAX, RCX); rex(0, RAX, 0, RAX, false); e8(0x69); e8(0xC0); e32(0x00010001u); }
         else gld32(RAX, RCX);
