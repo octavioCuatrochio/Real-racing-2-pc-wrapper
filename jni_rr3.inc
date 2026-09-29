@@ -34,11 +34,15 @@ static u64 j_gv_init(cpu_t *c, u32 self, jargs_t *a);
 static u64 j_gv_init_para(cpu_t *c, u32 self, jargs_t *a);
 static u64 j_gv_create_texture(cpu_t *c, u32 self, jargs_t *a);
 static u64 j_gv_render_to_texture(cpu_t *c, u32 self, jargs_t *a);
+static u64 j_font_get_size(cpu_t *c, u32 self, jargs_t *a);
+static u64 j_font_get_wscale(cpu_t *c, u32 self, jargs_t *a);
 
 static const jimpl_ent rr3_impls[] = {
     { "com/firemint/realracing/Font", "init", NULL, j_font_init },
     { "com/firemint/realracing/Font", "loadGlyph", NULL, j_font_load_glyph },
     { "com/firemint/realracing/Font", "loadBitmap", NULL, j_font_load_bitmap },
+    { "com/firemint/realracing/Font", "getSize", NULL, j_font_get_size },
+    { "com/firemint/realracing/Font", "getWidthScale", NULL, j_font_get_wscale },
     { "com/firemint/realracing/GlyphVector", "init", NULL, j_gv_init },
     { "com/firemint/realracing/GlyphVector", "initWithParagraph", NULL, j_gv_init_para },
     { "com/firemint/realracing/GlyphVector", "createTexture", NULL, j_gv_create_texture },

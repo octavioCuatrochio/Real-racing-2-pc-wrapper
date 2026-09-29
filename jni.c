@@ -812,6 +812,13 @@ static void e_GetField(cpu_t *c)
     if (o && o->kind != K_CLASS) o->refs++;             /* GetObjectField returns a new local reference */
     pthread_mutex_unlock(&jlock);
     if (o && o->kind != K_CLASS) lf_push_handle((u32)r);
+    static int ft = -1;
+    if (ft < 0) ft = getenv("RR2_FIELD_TRACE") ? 400 : 0;
+    if (ft > 0) {
+        u32 fi = (harg(c, 2) - JFID_BASE) >> 2;
+        if (fi < (u32)nfields) { ft--; LOG("[jni] get %s.%s = %llx (%s)\n", jclass_name(fields[fi].cls), fields[fi].name,
+                                        (unsigned long long)r, v ? "set" : "unset"); }
+    }
     hret64(c, r);
 }
 static void e_SetField32(cpu_t *c)

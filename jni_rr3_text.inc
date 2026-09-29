@@ -248,6 +248,17 @@ static u64 j_font_load_bitmap(cpu_t *c, u32 self, jargs_t *a)
     return 1;
 }
 
+static u64 j_font_get_size(cpu_t *c, u32 self, jargs_t *a)
+{
+    font_t *f = jo_native(self);
+    float v = f ? f->size : 0; u32 b; memcpy(&b, &v, 4); return b;
+}
+static u64 j_font_get_wscale(cpu_t *c, u32 self, jargs_t *a)
+{
+    font_t *f = jo_native(self);
+    float v = f ? f->wscale : 1; u32 b; memcpy(&b, &v, 4); return b;
+}
+
 /* ---------------- GlyphVector ---------------- */
 #define GV_MAXCP 4096
 #define GV_MAXLINES 64
@@ -263,6 +274,7 @@ typedef struct {
 
 static void gv_publish(u32 self, gv_t *g, float offx, float offy)
 {
+    if (!jfield_get(self, GV_CLS, "texId", "I")) set_i(self, GV_CLS, "texId", -1);   /* Java initializer: no texture yet */
     set_f(self, GV_CLS, "offsetX", offx);
     set_f(self, GV_CLS, "offsetY", offy);
     set_f(self, GV_CLS, "boundsW", (float)(g->bounds.r - g->bounds.l));
@@ -283,6 +295,9 @@ static u64 j_gv_init(cpu_t *c, u32 self, jargs_t *a)
     g->bounds.t--; g->bounds.b++;
     jo_set_native(self, g);
     gv_publish(self, g, (float)-g->bounds.l, (float)-g->bounds.t);
+    static int dbg = -1;
+    if (dbg < 0) dbg = getenv("RR3_TEXT_DEBUG") ? 40 : 0;
+    if (dbg > 0) { dbg--; LOG("[text] init '%s' size %.1f -> bounds %d,%d..%d,%d\n", jstr(txt), f->size, g->bounds.l, g->bounds.t, g->bounds.r, g->bounds.b); }
     return 0;
 }
 
