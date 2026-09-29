@@ -853,6 +853,80 @@ static void test_fuzz_neon_jit(cpu_t *c)
     CHECK(bad == 0 && tested > 50000);
 }
 
+/* whole blocks: random straight-line sequences, JIT vs the reference stepping one at a time.
+ * Memory ops address off r12/sp, which nothing in the sequence writes. */
+bool jit_test_seq(cpu_t *c, u32 pc, const u32 *insns, int n);
+static bool seq_ok(u32 insn)
+{
+    u32 cls = (insn >> 25) & 7, rd = (insn >> 12) & 0xF, rn = (insn >> 16) & 0xF;
+    di_t d;
+    if (!cpu_decode_one(&d, TBASE, insn) && !jit_arm7_covers(insn)) return false;
+    if (cls <= 1) {
+        bool mul = cls == 0 && (insn & 0xF0) == 0x90;
+        if (!mul && !(insn & (1u << 25)) && (insn & 0x90) == 0x90) return false;   /* extra load/store, swp */
+        if (!mul && !(insn & (1u << 25)) && (insn & 0x10) && ((insn >> 8) & 0xF) == 15) return false;
+        u32 w = mul ? rn : rd;                                                      /* mul: rd is bits 19:16 */
+        if (w >= 12 || (mul && (insn & (1u << 23)) && rd >= 12)) return false;
+        if (!mul && ((insn >> 21) & 0xF) >= 8 && ((insn >> 21) & 0xF) <= 11 && !(insn & (1u << 20))) return false;  /* misc space */
+        if ((insn & 0xF) == 15 || rn == 15) return false;
+        return true;
+    }
+    if (cls == 2) {                                                                 /* ldr/str imm offset, no writeback */
+        if (!((insn >> 24) & 1) || ((insn >> 21) & 1)) return false;
+        if (rn != 12 && rn != 13) return false;
+        return rd < 12;
+    }
+    return false;
+}
+static void test_fuzz_blocks(cpu_t *c)
+{
+    enum { MEM = 0x3000, N = 8 };
+    static u8 mem0[MEM], mem1[MEM];
+    const u32 pc = TBASE + 0x400;
+    int tested = 0, bad = 0;
+    for (int it = 0; it < 40000 && bad < 6; it++) {
+        u32 code[N];
+        for (int k = 0; k < N; ) {
+            u32 kind = fz() % 3, cond = (fz() & 3) ? 0xE : fz() % 15, insn = cond << 28;
+            if (kind == 0) insn |= fz() & 0x03FFFFFFu;
+            else if (kind == 1) insn |= 0x05000000u | (fz() & 0x00DFFFFFu);
+            else insn |= 0x90u | (fz() & 0x003FFF0Fu);
+            if (kind != 1) {                                                        /* bias registers into r0-r5 */
+                insn = (insn & ~0x000FF00Fu) | (fz() % 6) << 16 | (fz() % 6) << 12 | (fz() % 6);
+                if (kind == 2) insn = (insn & ~0x00000F00u) | (fz() % 6) << 8;
+            } else insn = (insn & ~0x000FF000u) | (12u + (fz() & 1)) << 16 | (fz() % 6) << 12;
+            if (seq_ok(insn)) code[k++] = insn;
+        }
+        u32 r0[16], cpsr0 = fz() & 0xF0000000u;
+        for (int i = 0; i < 12; i++) r0[i] = (fz() & 1) ? fz() : fz() & 0xFF;
+        r0[12] = TDATA + 0x800 + (fz() & 0x3FC); r0[13] = TDATA + 0x1800 + (fz() & 0x3FC); r0[14] = fz();
+        for (int i = 0; i < MEM; i++) mem0[i] = (u8)fz();
+
+        memcpy(c->r, r0, sizeof(r0)); c->cpsr = cpsr0; memset(&c->v, 0, sizeof(c->v)); c->fpscr = 0;
+        memcpy(g2h(TDATA), mem0, MEM);
+        for (int k = 0; k < N; k++) {
+            c->r[15] = pc + 4 * k + 4;
+            if (cond_ok(code[k] >> 28, c->cpsr)) dec_table[DEC_KEY(code[k])](c, code[k]);
+        }
+        u32 rg[16], fg = c->cpsr; memcpy(rg, c->r, sizeof(rg)); memcpy(mem1, g2h(TDATA), MEM);
+
+        memcpy(c->r, r0, sizeof(r0)); c->cpsr = cpsr0; memset(&c->v, 0, sizeof(c->v)); c->fpscr = 0;
+        memcpy(g2h(TDATA), mem0, MEM);
+        if (!jit_test_seq(c, pc, code, N)) continue;
+        tested++;
+        if (memcmp(rg, c->r, 15 * 4) || (fg & 0xF0000000u) != (c->cpsr & 0xF0000000u) || memcmp(mem1, g2h(TDATA), MEM)) {
+            bad++;
+            LOG("BLOCK mismatch:");
+            for (int k = 0; k < N; k++) LOG(" %08x", code[k]);
+            LOG("\n  cpsr %08x vs %08x", fg, c->cpsr);
+            for (int i = 0; i < 15; i++) if (rg[i] != c->r[i]) LOG(" r%d %08x vs %08x", i, rg[i], c->r[i]);
+            LOG("%s\n", memcmp(mem1, g2h(TDATA), MEM) ? " (memory differs)" : "");
+        }
+    }
+    LOG("[selftest] block fuzz: %d blocks of %d compared, %d mismatches\n", tested, N, bad);
+    CHECK(bad == 0 && tested > 20000);
+}
+
 int selftest_main(void)
 {
     cpu_t *c = emu_new_cpu();
@@ -878,6 +952,7 @@ int selftest_main(void)
     test_fuzz_fast(c);
     test_fuzz_fused(c);
     test_fuzz_neon_jit(c);
+    test_fuzz_blocks(c);
 
     LOG("[selftest] %d passed, %d failed\n", passes, fails);
     return fails ? 1 : 0;

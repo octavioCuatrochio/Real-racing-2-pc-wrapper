@@ -82,12 +82,61 @@ static void mrm_mem(int w, const u8 *op, int nop, int reg, int idx, bool force, 
 #define OFF_ICNT   ((s32)offsetof(cpu_t, insn_count))
 #define OFF_LINK   ((s32)offsetof(cpu_t, jit_link))
 
-static void ld_r(int x, s32 off)  { static const u8 o[] = { 0x8B }; mrm_rbx(0, o, 1, x, off); }  /* mov x32,[rbx+off] */
-static void st_r(int x, s32 off)  { static const u8 o[] = { 0x89 }; mrm_rbx(0, o, 1, x, off); }  /* mov [rbx+off],x32 */
-static void st_imm(s32 off, u32 v) { rex(0, 0, 0, RBX, false); e8(0xC7); e8(0x83); e32((u32)off); e32(v); }
 static void mov_ri(int x, u32 v)  { rex(0, 0, 0, x, false); e8(0xB8 + (x & 7)); e32(v); }
 static void mov_ri64(int x, u64 v) { rex(1, 0, 0, x, false); e8(0xB8 + (x & 7)); e64(v); }
 static void mov_rr(int d, int s)  { static const u8 o[] = { 0x89 }; mrm_rr(0, o, 1, s, d, false); }
+
+/* Guest register cache, per block and write-through: r0-r14 stay in host registers once loaded or
+ * written, while every store still reaches cpu_t, so exits and handlers see memory as is. Dropped at
+ * block start, after any call (handlers may write registers) and at every forward-branch join. */
+#define RC_N 4
+static const int rc_host[RC_N] = { R12, R13, R14, RBP };
+static int rc_greg[RC_N] = { -1, -1, -1, -1 };
+static unsigned rc_stamp[RC_N], rc_clock;
+static void rc_reset(void) { for (int i = 0; i < RC_N; i++) rc_greg[i] = -1; }
+static int rc_greg_of(s32 off)
+{
+    s32 d = off - (s32)offsetof(cpu_t, r);
+    return d >= 0 && d < 15 * 4 && !(d & 3) ? d / 4 : -1;
+}
+static int rc_find(int g)
+{
+    for (int i = 0; i < RC_N; i++) if (rc_greg[i] == g) { rc_stamp[i] = ++rc_clock; return i; }
+    return -1;
+}
+static int rc_take(int g)
+{
+    int i = rc_find(g);
+    if (i >= 0) return i;
+    i = 0;
+    for (int k = 1; k < RC_N; k++) if (rc_greg[k] < 0 || (rc_greg[i] >= 0 && rc_stamp[k] < rc_stamp[i])) i = k;
+    rc_greg[i] = g; rc_stamp[i] = ++rc_clock;
+    return i;
+}
+typedef struct { int g[RC_N]; unsigned st[RC_N]; } rc_snap_t;     /* for code that is emitted, then rolled back */
+static rc_snap_t rc_save(void) { rc_snap_t v; memcpy(v.g, rc_greg, sizeof(v.g)); memcpy(v.st, rc_stamp, sizeof(v.st)); return v; }
+static void rc_restore(const rc_snap_t *v) { memcpy(rc_greg, v->g, sizeof(v->g)); memcpy(rc_stamp, v->st, sizeof(v->st)); }
+static void rc_drop(int g) { for (int i = 0; i < RC_N; i++) if (rc_greg[i] == g) rc_greg[i] = -1; }
+
+static void ld_r(int x, s32 off)                                    /* mov x32,[rbx+off] */
+{
+    int g = rc_greg_of(off), i = g >= 0 ? rc_find(g) : -1;
+    if (i >= 0) { mov_rr(x, rc_host[i]); return; }
+    static const u8 o[] = { 0x8B }; mrm_rbx(0, o, 1, x, off);
+    if (g >= 0) mov_rr(rc_host[rc_take(g)], x);
+}
+static void st_r(int x, s32 off)                                    /* mov [rbx+off],x32 */
+{
+    static const u8 o[] = { 0x89 }; mrm_rbx(0, o, 1, x, off);
+    int g = rc_greg_of(off);
+    if (g >= 0) mov_rr(rc_host[rc_take(g)], x);
+}
+static void st_imm(s32 off, u32 v)
+{
+    rex(0, 0, 0, RBX, false); e8(0xC7); e8(0x83); e32((u32)off); e32(v);
+    int g = rc_greg_of(off);
+    if (g >= 0) mov_ri(rc_host[rc_take(g)], v);
+}
 /* alu d, s: 0 add 1 or 2 adc 3 sbb 4 and 5 sub 6 xor 7 cmp */
 static void alu_rr(int k, int d, int s) { u8 o = (u8)(k * 8 + 1); mrm_rr(0, &o, 1, s, d, false); }
 static void alu_ri(int k, int d, u32 imm) { rex(0, 0, 0, d, false); e8(0x81); e8(0xC0 | (k << 3) | (d & 7)); e32(imm); }
@@ -101,8 +150,12 @@ static void movzx8(int d, int s) { static const u8 o[] = { 0x0F, 0xB6 }; mrm_rr(
 static void bt_rr(int base, int bit) { static const u8 o[] = { 0x0F, 0xA3 }; mrm_rr(0, o, 2, bit, base, false); }
 static u8 *jcc32(int cc) { e8(0x0F); e8(0x80 + cc); u8 *at = p; e32(0); return at; }
 static u8 *jmp32(void) { e8(0xE9); u8 *at = p; e32(0); return at; }
-static void patch32(u8 *at, u8 *target) { s32 rel = (s32)(target - (at + 4)); memcpy(at, &rel, 4); }
-static void call_abs(void *fn) { mov_ri64(RAX, (u64)(uintptr_t)fn); e8(0xFF); e8(0xD0); }
+static void patch32(u8 *at, u8 *target)
+{
+    s32 rel = (s32)(target - (at + 4)); memcpy(at, &rel, 4);
+    if (target == p) rc_reset();                /* a join: the other path never filled the cache */
+}
+static void call_abs(void *fn) { mov_ri64(RAX, (u64)(uintptr_t)fn); e8(0xFF); e8(0xD0); rc_reset(); }
 /* guest memory access, address in idx register (32-bit, zero-extended) */
 static void gld32(int d, int idx) { static const u8 o[] = { 0x8B }; mrm_mem(0, o, 1, d, idx, false, false); }
 static void gld64(int d, int idx) { static const u8 o[] = { 0x8B }; mrm_mem(1, o, 1, d, idx, false, false); }
@@ -115,7 +168,12 @@ static void gst64(int s, int idx) { static const u8 o[] = { 0x89 }; mrm_mem(1, o
 static void gst8(int s, int idx)  { static const u8 o[] = { 0x88 }; mrm_mem(0, o, 1, s, idx, s >= 4, false); }
 static void gst16(int s, int idx) { static const u8 o[] = { 0x89 }; mrm_mem(0, o, 1, s, idx, false, true); }
 static void ld64_rbx(int x, s32 off) { static const u8 o[] = { 0x8B }; mrm_rbx(1, o, 1, x, off); }
-static void st64_rbx(int x, s32 off) { static const u8 o[] = { 0x89 }; mrm_rbx(1, o, 1, x, off); }
+static void st64_rbx(int x, s32 off)
+{
+    static const u8 o[] = { 0x89 }; mrm_rbx(1, o, 1, x, off);
+    int g = rc_greg_of(off);
+    if (g >= 0) { rc_drop(g); rc_drop(g + 1); }
+}
 /* SSE scalar single: op xmm, [rbx+off] (0x10 movss load, 0x58 add, 0x59 mul, 0x5C sub, 0x5E div) */
 static void sse_ss(u8 op, int x, s32 off) { e8(0xF3); u8 o[2] = { 0x0F, op }; mrm_rbx(0, o, 2, x, off); }
 static void sse_st(int x, s32 off) { e8(0xF3); static const u8 o[] = { 0x0F, 0x11 }; mrm_rbx(0, o, 2, x, off); }
@@ -1061,10 +1119,12 @@ bool jit_arm7_covers(u32 insn)
 {
     static u8 scratch[4096];
     u8 *save = p;
+    rc_snap_t rcs = rc_save();
     p = scratch;
     u32 cls = (insn >> 25) & 7;
     bool ok = emit_arm7(insn) || ((cls == 6 || cls == 7) && emit_vfp2(insn, TBASE_DUMMY));
     p = save;
+    rc_restore(&rcs);
     return ok;
 }
 
@@ -1073,9 +1133,11 @@ bool jit_neon_covers(u32 insn)
 {
     static u8 scratch[4096];
     u8 *save = p;
+    rc_snap_t rcs = rc_save();
     p = scratch;
     bool ok = emit_neon(insn);
     p = save;
+    rc_restore(&rcs);
     return ok;
 }
 
@@ -1178,8 +1240,9 @@ static bool try_fused(u32 pc, u32 insn, bool *ended)
     if (cc < 0) return false;
     int cm = 0; u32 cv = 0;
     u8 *save = p;
-    if (!dp_operand(insn, pc, &cm, &cv)) { p = save; return false; }
-    if (kind == 2 && cm == 1) { p = save; return false; }            /* shifter carry: plain path */
+    rc_snap_t rcs = rc_save();
+    if (!dp_operand(insn, pc, &cm, &cv)) { p = save; rc_restore(&rcs); return false; }
+    if (kind == 2 && cm == 1) { p = save; rc_restore(&rcs); return false; }   /* shifter carry: plain path */
     get_reg(RAX, rn, pc);
     switch (opc) {
     case 0x0: case 0x8: alu_rr(4, RAX, RDX); break;
@@ -1414,6 +1477,7 @@ static void *compile_block_thumb(u32 pc0, int max_insns)
     p = jc_ptr;
     npend = 0;
     u8 *code = p;
+    rc_reset();
     e8(0x48); e8(0x81); e8(0x83); e32((u32)OFF_ICNT); u8 *cnt_at = p; e32(0);
     u32 pc = pc0;
     int n = 0;
@@ -1529,6 +1593,7 @@ static void *compile_block(u32 pc0, int max_insns)
     p = jc_ptr;
     npend = 0;
     u8 *code = p;
+    rc_reset();
     /* add qword [rbx+icnt], N (patched once N is known) */
     e8(0x48); e8(0x81); e8(0x83); e32((u32)OFF_ICNT); u8 *cnt_at = p; e32(0);
     u32 pc = pc0;
@@ -1576,6 +1641,7 @@ static bool jit_init(void)
     /* entry(cpu=rdi, mem=rsi, code=rdx) */
     jit_enter = (jit_entry_t)(void *)p;
     e8(0x53); e8(0x41); e8(0x54); e8(0x41); e8(0x55); e8(0x41); e8(0x56); e8(0x41); e8(0x57);  /* push rbx,r12-r15 */
+    e8(0x55); e8(0x48); e8(0x83); e8(0xEC); e8(0x08);   /* push rbp; sub rsp, 8 (calls stay 16-aligned) */
     e8(0x48); e8(0x89); e8(0xFB);               /* mov rbx, rdi */
     e8(0x49); e8(0x89); e8(0xF7);               /* mov r15, rsi */
     e8(0xFF); e8(0xE2);                         /* jmp rdx */
@@ -1583,6 +1649,7 @@ static bool jit_init(void)
     /* exit stub: record link slot, restore, return */
     jit_exit_stub = p;
     st64_rbx(RAX, OFF_LINK);
+    e8(0x48); e8(0x83); e8(0xC4); e8(0x08); e8(0x5D);   /* add rsp, 8; pop rbp */
     e8(0x41); e8(0x5F); e8(0x41); e8(0x5E); e8(0x41); e8(0x5D); e8(0x41); e8(0x5C); e8(0x5B);  /* pop r15..r12, rbx */
     e8(0xC3);
     jc_ptr = (u8 *)(((uintptr_t)p + 15) & ~(uintptr_t)15);
@@ -1668,6 +1735,13 @@ static void *block_for(u32 pc, bool thumb)
         if (!blk_map) blk_map = calloc(MAX_BLOCKS, sizeof(*blk_map));
         if (nblk < MAX_BLOCKS) { blk_map[nblk].code = b; blk_map[nblk].pc = pc; nblk++; }
         __atomic_store_n(&jit_table[i], b, __ATOMIC_RELEASE);
+        static long dump_pc = -2;                   /* RR2_JIT_DUMP=hexpc: host code of that block -> jit_<pc>.bin */
+        if (dump_pc == -2) dump_pc = getenv("RR2_JIT_DUMP") ? strtol(getenv("RR2_JIT_DUMP"), NULL, 16) : -1;
+        if ((long)pc == dump_pc) {
+            char fn[64]; snprintf(fn, sizeof(fn), "jit_%08x.bin", pc);
+            FILE *f = fopen(fn, "wb");
+            if (f) { fwrite(b, 1, (size_t)(jc_ptr - (u8 *)b), f); fclose(f); }
+        }
     }
     pthread_mutex_unlock(&jit_lock);
     return b;
@@ -1720,6 +1794,26 @@ bool jit_test_one(cpu_t *c, u32 pc, u32 insn)
     c->r[15] = pc;
     jit_enter(c, g_mem, b);
     jc_ptr = save_ptr;                          /* reuse the space */
+    return true;
+}
+
+/* selftest: n straight-line ARM instructions compiled as one block (register cache, joins) */
+bool jit_test_seq(cpu_t *c, u32 pc, const u32 *insns, int n)
+{
+    if (!jit_init() || n > 32) return false;
+    pthread_mutex_lock(&jit_lock);
+    u32 save_lo = G.text_lo, save_span = G.text_span, orig[32];
+    for (int i = 0; i < n; i++) { orig[i] = ld32(pc + 4 * i); st32(pc + 4 * i, insns[i]); }
+    G.text_lo = pc; G.text_span = 4 * (u32)n;
+    u8 *save_ptr = jc_ptr;
+    void *b = compile_block(pc, n);
+    G.text_lo = save_lo; G.text_span = save_span;
+    for (int i = 0; i < n; i++) st32(pc + 4 * i, orig[i]);
+    pthread_mutex_unlock(&jit_lock);
+    if (!b) return false;
+    c->r[15] = pc;
+    jit_enter(c, g_mem, b);
+    jc_ptr = save_ptr;
     return true;
 }
 

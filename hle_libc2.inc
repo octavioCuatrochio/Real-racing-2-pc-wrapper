@@ -298,9 +298,15 @@ static void hle_getpid(cpu_t *c) { hret(c, 4242); }
 static void hle_getuid(cpu_t *c) { hret(c, 10127); }
 static void hle_getpwuid_r(cpu_t *c) { if (harg(c,4)) st32(harg(c,4), 0); hret(c, 2 /* ENOENT */); }
 static void hle_dup2(cpu_t *c) { hret(c, (u32)dup2((int)harg(c,0), (int)harg(c,1))); }
-static void hle_select(cpu_t *c)                        /* only ever reached for sockets here: timeout */
+/* only ever reached for sockets, which never exist offline: wait out the timeout (at most 1 s), nothing ready.
+ * Returning at once made fmRUDP's network thread spin a whole core. */
+static void hle_select(cpu_t *c)
 {
     for (int i = 1; i <= 3; i++) if (harg(c,i)) memset(g2h(harg(c,i)), 0, 128);
+    gptr tv = harg(c,4);
+    u64 us = tv ? (u64)ld32(tv) * 1000000 + ld32(tv + 4) : 1000000;
+    if (us > 1000000) us = 1000000;
+    if (us) usleep((useconds_t)us);
     hret(c, 0);
 }
 
