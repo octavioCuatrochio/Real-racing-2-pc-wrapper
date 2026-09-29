@@ -114,7 +114,7 @@ void cpu_run(cpu_t *c)
     };
     tls_cpu = c;
     if (__builtin_expect(g_verbose >= 3, 0)) { cpu_run_trace(c); return; }
-    if (g_jit && !(c->cpsr & FLAG_T)) {
+    if (g_jit) {
         c->span = G.text_span;
         if (jit_run(c, run_slow)) return;
     }

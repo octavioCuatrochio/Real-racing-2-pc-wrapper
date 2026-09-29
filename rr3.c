@@ -34,6 +34,70 @@ static void jcall(cpu_t *c, u32 f, int n, const u32 *extra)
     jni_pop_frame();
 }
 
+/* ---- input: mouse -> touch, keyboard / gamepad -> one virtual Android controller ---- */
+static cpu_t *g_ui;
+static u32 f_touch_begin, f_touch_move, f_touch_end, f_key_down, f_key_up, f_pad_btn, f_pad_axis, g_cm;
+
+static inline u32 fbits(float f) { u32 b; memcpy(&b, &f, 4); return b; }
+
+static void on_touch3(int action, int x, int y)
+{
+    if (!g_ui) return;
+    u32 a[4] = { 0, fbits((float)x), fbits((float)y), 1 };
+    if (action == 0) jcall(g_ui, f_touch_begin, 3, a);
+    else if (action == 2) jcall(g_ui, f_touch_move, 3, a);
+    else jcall(g_ui, f_touch_end, 4, a);
+}
+
+static void pad_call(cpu_t *c, u32 f, int n, const u32 *extra)
+{
+    if (!f) return;
+    u32 a[8] = { jni_env_ptr(), g_cm };
+    for (int i = 0; i < n; i++) a[2 + i] = extra[i];
+    jni_push_frame();
+    emu_call(c, f, 2 + n, a);
+    jni_pop_frame();
+}
+static void pad_axis(cpu_t *c, int axis, float v)
+{
+    static float last[8] = { 9, 9, 9, 9, 9, 9, 9, 9 };
+    if (last[axis] == v) return;
+    last[axis] = v;
+    u32 a[3] = { 1, fbits(v), (u32)axis };
+    pad_call(c, f_pad_axis, 3, a);
+}
+static void pad_button(cpu_t *c, int btn, int down)
+{
+    u32 a[3] = { 1, (u32)down, (u32)btn };
+    pad_call(c, f_pad_btn, 3, a);
+}
+
+/* SDL game-controller button index -> RR3 ControllerButtons */
+static const s8 sdl_to_rr3[15] = { 0, 1, 2, 3, 12, -1, 13, -1, -1, 4, 5, 10, 11, 8, 9 };
+
+static void rr3_input(cpu_t *c)
+{
+    static float steer;
+    static u32 prev_btn;
+    static int backs, cams;
+    float d = g_input.steer_target - steer;
+    steer += d > 0.12f ? 0.12f : d < -0.12f ? -0.12f : d;
+    pad_axis(c, 0, steer);                                  /* AXIS_LTHUMB_X */
+    pad_axis(c, 5, g_input.gasv > 1 ? 1 : g_input.gasv);   /* AXIS_RTRIGGER */
+    pad_axis(c, 4, g_input.brakev > 1 ? 1 : g_input.brakev);   /* AXIS_LTRIGGER */
+    u32 b = g_input.pad_btn, ch = b ^ prev_btn;
+    for (int i = 0; i < 15; i++)
+        if (((ch >> i) & 1) && sdl_to_rr3[i] >= 0) pad_button(c, sdl_to_rr3[i], (b >> i) & 1);
+    prev_btn = b;
+    while (cams < g_input.camera) { pad_button(c, 3, 1); pad_button(c, 3, 0); cams++; }   /* camera: Y */
+    while (backs < g_input.back) {                          /* Android KEYCODE_BACK */
+        u32 k = 4;
+        jcall(c, f_key_down, 1, &k);
+        jcall(c, f_key_up, 1, &k);
+        backs++;
+    }
+}
+
 int rr3_main(const char *so_path)
 {
     G.game = 3;
@@ -75,6 +139,21 @@ int rr3_main(const char *so_path)
     u32 one = 1;
     jcall(c, fn("Java_com_firemint_realracing_MainActivity_onWindowFocusChangedJNI"), 1, &one);
 
+    g_ui = c;
+    f_touch_begin = fn("Java_com_firemint_realracing_MainActivity_onTouchBeginJNI");
+    f_touch_move = fn("Java_com_firemint_realracing_MainActivity_onTouchMoveJNI");
+    f_touch_end = fn("Java_com_firemint_realracing_MainActivity_onTouchEndJNI");
+    f_key_down = fn("Java_com_firemint_realracing_MainActivity_onKeyPressed");
+    f_key_up = fn("Java_com_firemint_realracing_MainActivity_onKeyReleased");
+    f_pad_btn = fn("Java_com_firemint_realracing_ControllerManager_SetButtonValueJNI");
+    f_pad_axis = fn("Java_com_firemint_realracing_ControllerManager_SetJoystickValueJNI");
+    g_cm = jni_object("com/firemint/realracing/ControllerManager");
+    host_set_input(on_touch3);
+    {
+        u32 a[4] = { jni_string("Xbox Wireless Controller"), jni_string("rr2emu-virtual-pad"), 1, 0x3FF };
+        pad_call(c, fn("Java_com_firemint_realracing_ControllerManager_ControllerConnectedJNI"), 4, a);
+    }
+
     u32 render = fn("Java_com_firemint_realracing_MainActivity_onViewRenderJNI");
     u32 ra[2] = { orient, rot };
     LOG("[rr3] render loop (max_frames=%d)\n", G.max_frames);
@@ -84,6 +163,7 @@ int rr3_main(const char *so_path)
     long frames = 0;
     for (; render && (!G.max_frames || frames < G.max_frames); frames++) {
         g_frame = frames;
+        rr3_input(c);
         jcall(c, render, 2, ra);
         extern void frame_screenshots(long frame);
         frame_screenshots(frames);

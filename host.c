@@ -337,6 +337,7 @@ const char *host_bind_name(int slot, int code)
 }
 
 static u8 key_held[ACT_COUNT][2], btn_held[ACT_COUNT][2];
+static u32 pad_raw, key_nav;
 static float axes[6];
 host_input_t g_input;
 
@@ -377,6 +378,11 @@ bool host_present(void)
             s32 sym; memcpy(&sym, e.pad + 20, 4);
             int d = e.type == SDL_KEYDOWN;
             if (d && e.pad[13]) break;                          /* auto-repeat */
+            {
+                u32 bit = sym == SDLK_UP ? 1u << 11 : sym == SDLK_DOWN ? 1u << 12 : sym == SDLK_LEFT ? 1u << 13 :
+                          sym == SDLK_RIGHT ? 1u << 14 : (sym == 13 || sym == SDLK_KP_ENTER || sym == ' ') ? 1u : sym == 8 ? 2u : 0;
+                if (d) key_nav |= bit; else key_nav &= ~bit;
+            }
             for (int a = 0; a < ACT_COUNT; a++)
                 for (int s = 0; s < 2; s++)
                     if (g_binds[a][s] && g_binds[a][s] == sym) { if (d && !key_held[a][s]) act_edge(a); key_held[a][s] = d; }
@@ -393,6 +399,7 @@ bool host_present(void)
         case SDL_CONTROLLERBUTTONDOWN:
         case SDL_CONTROLLERBUTTONUP: {
             int d = e.type == SDL_CONTROLLERBUTTONDOWN;
+            if (e.pad[12] < 32) { if (d) pad_raw |= 1u << e.pad[12]; else pad_raw &= ~(1u << e.pad[12]); }
             for (int a = 0; a < ACT_COUNT; a++)
                 for (int s = 2; s < 4; s++)
                     if (g_binds[a][s] == e.pad[12]) { if (d && !btn_held[a][s - 2]) act_edge(a); btn_held[a][s - 2] = d; }
@@ -418,8 +425,11 @@ bool host_present(void)
     if (r < 0.12f) r = 0;
     float st = r - l;
     g_input.steer_target = st > 1 ? 1 : st < -1 ? -1 : st;
-    g_input.gas = act_amount(ACT_GAS) > 0.3f;
-    g_input.brake = act_amount(ACT_BRAKE) > 0.3f;
+    g_input.gasv = act_amount(ACT_GAS);
+    g_input.brakev = act_amount(ACT_BRAKE);
+    g_input.gas = g_input.gasv > 0.3f;
+    g_input.brake = g_input.brakev > 0.3f;
+    g_input.pad_btn = pad_raw | key_nav;
     return true;
 }
 

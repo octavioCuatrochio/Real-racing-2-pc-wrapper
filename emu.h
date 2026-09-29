@@ -325,7 +325,12 @@ int   rr3_main(const char *so_path);
 void  patches_setup(void);
 int   inflate_raw(const u8 *in, size_t n, u8 *out, size_t outn);
 void  patch_svc(cpu_t *c, u32 id);
-typedef struct { float steer_target; int gas, brake; int back, camera; } host_input_t;
+typedef struct {
+    float steer_target; int gas, brake; int back, camera;
+    float gasv, brakev;          /* analog pedal amounts 0..1 */
+    u32 pad_btn;                 /* raw SDL game-controller buttons held (bit = SDL index), keyboard nav folded in:
+                                    arrows -> d-pad 11..14, Enter/Space -> A (0), Backspace -> B (1) */
+} host_input_t;
 extern volatile int g_hide_next_tex;     /* set by the VFS when a HUD image is opened: 1 hidden, 2 race marker */
 extern volatile int g_race_hud_drawn;    /* set by glhost when the race HUD marker is drawn */
 extern host_input_t g_input;

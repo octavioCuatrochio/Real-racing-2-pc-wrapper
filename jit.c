@@ -218,12 +218,10 @@ static void flush_slots(void)
     npend = 0;
 }
 
-/* eax = target: store, then inline table lookup; miss -> stub with rax = 0 */
+/* eax = target (Thumb state already in cpsr): store, inline table lookup; miss -> slow stub */
 static void emit_exit_indirect(void)
 {
     st_r(RAX, OFF_R(15));
-    e8(0xA8); e8(3);                            /* test al, 3: misaligned/thumb -> C side traps */
-    u8 *miss1 = jcc32(CC_NE);
     alu_ri(5, RAX, jt_lo);
     alu_ri(7, RAX, jt_words * 2);
     u8 *miss2 = jcc32(CC_AE);
@@ -234,9 +232,30 @@ static void emit_exit_indirect(void)
     u8 *miss3 = jcc32(CC_E);
     e8(0xFF); e8(0xE1);                         /* jmp rcx */
     u8 *miss = p;
-    patch32(miss1, miss); patch32(miss2, miss); patch32(miss3, miss);
+    patch32(miss2, miss); patch32(miss3, miss);
     u8 *j = jmp32(); patch32(j, jit_slow_ind ? jit_slow_ind : jit_exit_stub);
 }
+/* interworking branch (BX, LoadWritePC, ARM ALUWritePC): eax bit0 selects Thumb */
+static void emit_exit_indirect_iw(void)
+{
+    e8(0xA8); e8(1);                            /* test al, 1 */
+    u8 *arm = jcc32(CC_E);
+    alu_ri(4, RAX, ~1u);
+    ld_r(RCX, OFF_CPSR); alu_ri(1, RCX, FLAG_T); st_r(RCX, OFF_CPSR);
+    u8 *go = jmp32();
+    patch32(arm, p);
+    ld_r(RCX, OFF_CPSR); alu_ri(4, RCX, ~FLAG_T); st_r(RCX, OFF_CPSR);
+    patch32(go, p);
+    emit_exit_indirect();
+}
+
+/* Thumb blocks: fall-through address of the instruction being emitted, and the exact
+ * Thumb-decoded entry that handler fallbacks must run (NULL: decode the ARM word) */
+static u32 g_next;
+static bool g_tmode;
+static const di_t *g_fb_di;
+/* data-processing immediate the ARM word cannot encode (Thumb modified immediates) */
+static bool g_ovr; static u32 g_ovr_v; static int g_ovr_rot;
 
 /* fallback: run the interpreter's handler for this instruction */
 static void emit_call_handler(cpu_t *dummy, u32 pc, const di_t *src)
@@ -244,7 +263,7 @@ static void emit_call_handler(cpu_t *dummy, u32 pc, const di_t *src)
     (void)dummy;
     di_t *d = malloc(sizeof(*d));               /* lives as long as the code */
     *d = *src;
-    st_imm(OFF_R(15), pc + 4);
+    st_imm(OFF_R(15), g_next);
     e8(0x48); e8(0x89); e8(0xDF);               /* mov rdi, rbx */
     mov_ri64(RSI, (u64)(uintptr_t)d);
     dfn_t fn = d->op == OP_generic ? d_generic : d->h;
@@ -258,6 +277,11 @@ static void emit_call_handler(cpu_t *dummy, u32 pc, const di_t *src)
 /* operand2 of data processing -> RDX. sets *cmode/cval for logical S carry */
 static bool dp_operand(u32 insn, u32 pc, int *cmode, u32 *cval)
 {
+    if (g_ovr && (insn & (1u << 25))) {
+        mov_ri(RDX, g_ovr_v);
+        if (g_ovr_rot) { *cmode = 3; *cval = g_ovr_v >> 31; } else *cmode = 0;
+        return true;
+    }
     if (insn & (1u << 25)) {
         u32 imm = insn & 0xFF, rot = ((insn >> 8) & 0xF) * 2;
         u32 v = rot ? (imm >> rot) | (imm << (32 - rot)) : imm;
@@ -760,32 +784,40 @@ static bool emit_insn(u32 pc, u32 insn, bool *ended)
     u32 cond = insn >> 28, cls = (insn >> 25) & 7;
     if (cond == 0xF) {
         di_t d; cpu_decode_one(&d, pc, insn);
-        if (d.op != OP_nop) emit_call_handler(NULL, pc, &d);
+        if (g_fb_di) d = *g_fb_di;
+        if (d.op == OP_nop) return false;
+        emit_call_handler(NULL, pc, &d);
+        if ((insn & 0xFE000000u) == 0xFA000000u) {          /* blx imm: always leaves the block */
+            ld_r(RAX, OFF_R(15));
+            emit_exit_indirect();
+            *ended = true;
+            return true;
+        }
         return false;
     }
-    if (cond == 0xE && cls <= 1 && try_fused(pc, insn, ended)) return true;
+    if (!g_tmode && cond == 0xE && cls <= 1 && try_fused(pc, insn, ended)) return true;
     u8 *skip = cond != 0xE ? emit_cond_skip(cond) : NULL;
 
     /* branches end the block */
     if (cls == 5) {
         s32 off = (s32)(insn << 8) >> 6;
         u32 target = pc + 8 + (u32)off;
-        if (insn & (1u << 24)) st_imm(OFF_R(14), pc + 4);
+        if (insn & (1u << 24)) st_imm(OFF_R(14), g_next);
         emit_exit_direct(target);
         if (skip) patch32(skip, p);
         *ended = true;
-        emit_exit_direct(pc + 4);               /* condition failed: fall through */
+        emit_exit_direct(g_next);               /* condition failed: fall through */
         return true;
     }
     if ((insn & 0x0FFFFFF0u) == 0x012FFF10u || (insn & 0x0FFFFFF0u) == 0x012FFF30u) {   /* bx / blx */
         u32 rm = insn & 0xF;
         if (rm == 15) goto fallback;
         ld_r(RAX, OFF_R(rm));
-        if (insn & 0x20) st_imm(OFF_R(14), pc + 4);
-        emit_exit_indirect();
+        if (insn & 0x20) st_imm(OFF_R(14), g_next);
+        emit_exit_indirect_iw();
         if (skip) patch32(skip, p);
         *ended = true;
-        emit_exit_direct(pc + 4);
+        emit_exit_direct(g_next);
         return true;
     }
     /* pop {..., pc} / ldmia rn!, {..., pc} */
@@ -798,10 +830,10 @@ static bool emit_insn(u32 pc, u32 insn, bool *ended)
                 if (list & (1u << i)) { gld32(RAX, RCX); st_r(RAX, OFF_R(i)); alu_ri(0, RCX, 4); }
             gld32(RAX, RCX);
             if (W) { alu_ri(0, RCX, 4); st_r(RCX, OFF_R(rn)); }
-            emit_exit_indirect();
+            emit_exit_indirect_iw();
             if (skip) patch32(skip, p);
             *ended = true;
-            emit_exit_direct(pc + 4);
+            emit_exit_direct(g_next);
             return true;
         }
         goto fallback;
@@ -814,19 +846,19 @@ static bool emit_insn(u32 pc, u32 insn, bool *ended)
         if (off) alu_ri(U ? 0 : 5, RCX, off);
         if (W) st_r(RCX, OFF_R(rn));
         gld32(RAX, RCX);
-        emit_exit_indirect();
+        emit_exit_indirect_iw();
         if (skip) patch32(skip, p);
         *ended = true;
-        emit_exit_direct(pc + 4);
+        emit_exit_direct(g_next);
         return true;
     }
     /* mov pc, rm */
     if ((insn & 0x0FEFFFF0u) == 0x01A0F000u && (insn & 0xF) != 15) {
         ld_r(RAX, OFF_R(insn & 0xF));
-        emit_exit_indirect();
+        emit_exit_indirect_iw();
         if (skip) patch32(skip, p);
         *ended = true;
-        emit_exit_direct(pc + 4);
+        emit_exit_direct(g_next);
         return true;
     }
 
@@ -861,17 +893,194 @@ static bool emit_insn(u32 pc, u32 insn, bool *ended)
 fallback: {
         di_t d;
         cpu_decode_one(&d, pc, insn);
+        if (g_fb_di) d = *g_fb_di;
         if (d.op == OP_nop) { if (skip) patch32(skip, p); return false; }
         emit_call_handler(NULL, pc, &d);
         /* the handler may have branched: continue only if pc is still pc+4 */
         ld_r(RAX, OFF_R(15));
-        alu_ri(7, RAX, pc + 4);
+        alu_ri(7, RAX, g_next);
         u8 *same = jcc32(CC_E);
         emit_exit_indirect();
         patch32(same, p);
         if (skip) patch32(skip, p);
         return false;
     }
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Thumb blocks                                                        */
+/* ------------------------------------------------------------------ */
+
+static bool arm_imm_enc(u32 v, u32 *enc)
+{
+    for (u32 r = 0; r < 16; r++) {
+        u32 x = r ? (v << (2 * r)) | (v >> (32 - 2 * r)) : v;   /* rotate left undoes ROR 2r */
+        if (x < 256) { *enc = r << 8 | x; return true; }
+    }
+    return false;
+}
+
+/* ARM word with the same semantics as a Thumb fast-op entry (0: none); may set the dp override */
+static u32 arm_from_di(const di_t *d)
+{
+    int op = d->op;
+    u32 rd = d->rd, rn = d->rn, rm = d->rm;
+    s32 off = (s32)d->a;
+    u32 U = off >= 0, mag = U ? (u32)off : (u32)-off;
+    static const struct { int op; u8 L, B, P, W; } wb[] = {
+        { OP_ls_ldr, 1, 0, 1, 0 }, { OP_ls_str, 0, 0, 1, 0 }, { OP_ls_ldrb, 1, 1, 1, 0 }, { OP_ls_strb, 0, 1, 1, 0 },
+        { OP_ls_ldr_pre, 1, 0, 1, 1 }, { OP_ls_str_pre, 0, 0, 1, 1 }, { OP_ls_ldrb_pre, 1, 1, 1, 1 }, { OP_ls_strb_pre, 0, 1, 1, 1 },
+        { OP_ls_ldr_post, 1, 0, 0, 0 }, { OP_ls_str_post, 0, 0, 0, 0 }, { OP_ls_ldrb_post, 1, 1, 0, 0 }, { OP_ls_strb_post, 0, 1, 0, 0 },
+    };
+    for (unsigned i = 0; i < sizeof(wb) / sizeof(wb[0]); i++)
+        if (wb[i].op == op)
+            return mag < 4096 ? 0xE4000000u | (u32)wb[i].P << 24 | U << 23 | (u32)wb[i].B << 22 | (u32)wb[i].W << 21 |
+                                (u32)wb[i].L << 20 | rn << 16 | rd << 12 | mag : 0;
+    static const struct { int op; u8 L, SH, P, W; } hb[] = {
+        { OP_ls_ldrh, 1, 1, 1, 0 }, { OP_ls_strh, 0, 1, 1, 0 }, { OP_ls_ldrsb, 1, 2, 1, 0 }, { OP_ls_ldrsh, 1, 3, 1, 0 },
+        { OP_ls_ldrh_pre, 1, 1, 1, 1 }, { OP_ls_strh_pre, 0, 1, 1, 1 }, { OP_ls_ldrsb_pre, 1, 2, 1, 1 }, { OP_ls_ldrsh_pre, 1, 3, 1, 1 },
+        { OP_ls_ldrh_post, 1, 1, 0, 0 }, { OP_ls_strh_post, 0, 1, 0, 0 }, { OP_ls_ldrsb_post, 1, 2, 0, 0 }, { OP_ls_ldrsh_post, 1, 3, 0, 0 },
+    };
+    for (unsigned i = 0; i < sizeof(hb) / sizeof(hb[0]); i++)
+        if (hb[i].op == op)
+            return mag < 256 ? 0xE0400090u | (u32)hb[i].P << 24 | U << 23 | (u32)hb[i].W << 21 | (u32)hb[i].L << 20 |
+                               rn << 16 | rd << 12 | (mag >> 4) << 8 | (u32)hb[i].SH << 5 | (mag & 15) : 0;
+    static const struct { int op; u8 L, B; } rb[] = {
+        { OP_ls_ldr_reg, 1, 0 }, { OP_ls_str_reg, 0, 0 }, { OP_ls_ldrb_reg, 1, 1 }, { OP_ls_strb_reg, 0, 1 } };
+    for (unsigned i = 0; i < 4; i++)
+        if (rb[i].op == op)
+            return 0xE7000000u | 1u << 24 | (u32)!d->a << 23 | (u32)rb[i].B << 22 | (u32)rb[i].L << 20 |
+                   rn << 16 | rd << 12 | (d->b & 31) << 7 | rm;
+    static const struct { int op; u8 L, SH; } hr[] = {
+        { OP_ls_ldrh_rr, 1, 1 }, { OP_ls_strh_rr, 0, 1 }, { OP_ls_ldrsb_rr, 1, 2 }, { OP_ls_ldrsh_rr, 1, 3 } };
+    for (unsigned i = 0; i < 4; i++)
+        if (hr[i].op == op) return 0xE1800090u | (u32)hr[i].L << 20 | rn << 16 | rd << 12 | (u32)hr[i].SH << 5 | rm;
+    if (op >= OP_dp_0x0_0i && op < OP_dp_0x0_0i + 16 * 6 && (op - OP_dp_0x0_0i) % 6 < 2) {
+        u32 idx = (u32)(op - OP_dp_0x0_0i), opc = idx / 6, S = idx % 6, enc;
+        u32 w = 0xE2000000u | opc << 21 | S << 20 | rn << 16 | rd << 12;
+        bool ok = arm_imm_enc(d->a, &enc);
+        if (ok && (d->b != 0) == (enc >= 0x100)) return w | enc;   /* same carry rule */
+        g_ovr = true; g_ovr_v = d->a; g_ovr_rot = d->b != 0;
+        return w;
+    }
+    return 0;
+}
+
+static bool thumb_is_branchy(int op)
+{
+    return op == OP_t_tbb || op == OP_t_bwpc || op == OP_t_add_pc || op == OP_t_bx_pc || op == OP_generic ||
+           op == OP_ldm_ia_wb_pc || op == OP_ldr_pc || op == OP_ldr_pc_pre || op == OP_hook;
+}
+
+static void *compile_block_thumb(u32 pc0, int max_insns)
+{
+    if (jit_full || (u32)(jc_end - jc_ptr) < 64 * 1024) { jit_full = true; return NULL; }
+    p = jc_ptr;
+    npend = 0;
+    u8 *code = p;
+    e8(0x48); e8(0x81); e8(0x83); e32((u32)OFF_ICNT); u8 *cnt_at = p; e32(0);
+    u32 pc = pc0;
+    int n = 0;
+    bool ended = false;
+    g_tmode = true;
+    while (n < max_insns && !ended) {
+        if (pc - G.text_lo >= G.text_span) break;
+        di_t d;
+        thumb_decode(&d, pc);
+        u32 next = pc + d.len;
+        g_next = next; g_fb_di = &d; g_ovr = false;
+        n++;
+        int op = d.op;
+        u8 *skip = NULL;
+        bool conditional = d.cond != 0xE;
+        switch (op) {
+        case OP_nop:
+            break;
+        case OP_br_b:
+            if (conditional) skip = emit_cond_skip(d.cond);
+            emit_exit_direct(d.a);
+            if (skip) { patch32(skip, p); emit_exit_direct(next); }
+            ended = true;
+            break;
+        case OP_br_bl: case OP_t_blxi:
+            if (conditional) skip = emit_cond_skip(d.cond);
+            st_imm(OFF_R(14), d.b);
+            if (op == OP_t_blxi) { ld_r(RCX, OFF_CPSR); alu_ri(4, RCX, ~FLAG_T); st_r(RCX, OFF_CPSR); }
+            emit_exit_direct(d.a);
+            if (skip) { patch32(skip, p); emit_exit_direct(next); }
+            ended = true;
+            break;
+        case OP_br_bx: case OP_br_blx:
+            if (conditional) skip = emit_cond_skip(d.cond);
+            ld_r(RAX, OFF_R(d.rm));
+            if (op == OP_br_blx) st_imm(OFF_R(14), d.b);
+            emit_exit_indirect_iw();
+            if (skip) { patch32(skip, p); emit_exit_direct(next); }
+            ended = true;
+            break;
+        case OP_t_cbz: case OP_t_cbnz: {
+            ld_r(RAX, OFF_R(d.rn));
+            test_rr(RAX, RAX);
+            u8 *t = jcc32(op == OP_t_cbz ? CC_E : CC_NE);
+            emit_exit_direct(next);
+            patch32(t, p);
+            emit_exit_direct(d.a);
+            ended = true;
+            break; }
+        case OP_mov_const:
+            if (conditional) skip = emit_cond_skip(d.cond);
+            st_imm(OFF_R(d.rd), d.a);
+            if (skip) patch32(skip, p);
+            break;
+        case OP_ls_ldr_lit:
+            if (conditional) skip = emit_cond_skip(d.cond);
+            if (d.a - G.text_lo < G.text_span - 4) st_imm(OFF_R(d.rd), ld32(d.a));
+            else { mov_ri(RCX, d.a); gld32(RAX, RCX); st_r(RAX, OFF_R(d.rd)); }
+            if (skip) patch32(skip, p);
+            break;
+        case OP_add_pc_reg:
+            if (conditional) skip = emit_cond_skip(d.cond);
+            ld_r(RAX, OFF_R(d.rm)); alu_ri(0, RAX, d.a); st_r(RAX, OFF_R(d.rd));
+            if (skip) patch32(skip, p);
+            break;
+        case OP_t_bwpc: case OP_t_add_pc:
+            if (conditional) skip = emit_cond_skip(d.cond);
+            ld_r(RAX, OFF_R(d.rm));
+            if (op == OP_t_add_pc) alu_ri(0, RAX, d.a);
+            alu_ri(4, RAX, ~1u);
+            emit_exit_indirect();                                 /* stays in Thumb */
+            if (skip) { patch32(skip, p); emit_exit_direct(next); }
+            ended = true;
+            break;
+        default: {
+            u32 w = d.insn ? d.insn : arm_from_di(&d);
+            if (w && (w >> 28) == 0xE) {
+                w = (w & 0x0FFFFFFFu) | (u32)d.cond << 28;       /* IT condition */
+                if (emit_insn(pc, w, &ended)) ended = true;
+            } else {
+                if (conditional) skip = emit_cond_skip(d.cond);
+                emit_call_handler(NULL, pc, &d);
+                if (thumb_is_branchy(op) || (w >> 28) == 0xF) {
+                    ld_r(RAX, OFF_R(15));
+                    alu_ri(7, RAX, next);
+                    u8 *same = jcc32(CC_E);
+                    emit_exit_indirect();
+                    patch32(same, p);
+                }
+                if (skip) patch32(skip, p);
+            }
+            g_ovr = false;
+            break; }
+        }
+        pc = next;
+    }
+    if (!ended) emit_exit_direct(pc);
+    g_tmode = false; g_fb_di = NULL;
+    flush_slots();
+    memcpy(cnt_at, &n, 4);
+    jc_ptr = (u8 *)(((uintptr_t)p + 15) & ~(uintptr_t)15);
+    return code;
 }
 
 static void *compile_block(u32 pc0, int max_insns)
@@ -885,9 +1094,11 @@ static void *compile_block(u32 pc0, int max_insns)
     u32 pc = pc0;
     int n = 0;
     bool ended = false;
+    g_tmode = false; g_fb_di = NULL; g_ovr = false;
     while (n < max_insns) {
         if (pc - G.text_lo >= G.text_span) break;
         u32 insn = ld32(pc);
+        g_next = pc + 4;
         n++;
         if (max_insns == 1 && ((insn >> 25) & 7) <= 1 && (insn >> 28) == 0xE) {
             /* selftest single-insn mode: no fusion with a neighbour */
@@ -985,7 +1196,7 @@ static void emit_slow_indirect_stub(void)
     u8 *leave = jcc32(CC_NE);
     /* HLE returned to lr: look it up and continue in JIT code */
     ld_r(RAX, OFF_R(15));
-    e8(0xA8); e8(3);
+    e8(0xA8); e8(1);
     u8 *m1 = jcc32(CC_NE);
     alu_ri(5, RAX, jt_lo);
     alu_ri(7, RAX, jt_words * 2);
@@ -1003,14 +1214,14 @@ static void emit_slow_indirect_stub(void)
     p = (u8 *)(((uintptr_t)p + 15) & ~(uintptr_t)15);
 }
 
-static void *block_for(u32 pc)
+static void *block_for(u32 pc, bool thumb)
 {
     u32 i = (pc - jt_lo) >> 1;
     void *b = __atomic_load_n(&jit_table[i], __ATOMIC_ACQUIRE);
     if (b) return b;
     pthread_mutex_lock(&jit_lock);
     b = jit_table[i];
-    if (!b && (b = compile_block(pc, JIT_MAX_INSNS))) {
+    if (!b && (b = thumb ? compile_block_thumb(pc, JIT_MAX_INSNS) : compile_block(pc, JIT_MAX_INSNS))) {
         if (!blk_map) blk_map = calloc(MAX_BLOCKS, sizeof(*blk_map));
         if (nblk < MAX_BLOCKS) { blk_map[nblk].code = b; blk_map[nblk].pc = pc; nblk++; }
         __atomic_store_n(&jit_table[i], b, __ATOMIC_RELEASE);
@@ -1026,22 +1237,23 @@ bool jit_run(cpu_t *c, bool (*slow)(cpu_t *, u32))
     for (;;) {
         u32 pc = c->r[15];
         if (__builtin_expect(pc & 1, 0)) { cpu_set_pc(c, pc); pc = c->r[15]; }   /* raw bx target from JIT code */
-        if (c->cpsr & FLAG_T) return false;     /* Thumb: the interpreter runs it */
-        if (__builtin_expect(pc & 3, 0) && pc - jt_lo < jt_words * 2)
+        bool thumb = c->cpsr & FLAG_T;
+        if (__builtin_expect(!thumb && (pc & 3), 0) && pc - jt_lo < jt_words * 2)
             emu_trap(c, "ARM branch to misaligned %08x", pc);
-        if (pc - jt_lo >= jt_words * 2 || (pc & 3) || c->exit_loop) {
+        if (pc - jt_lo >= jt_words * 2 || c->exit_loop) {
             if (slow(c, pc)) return true;
             continue;
         }
-        void *b = block_for(pc);
+        void *b = block_for(pc, thumb);
         if (!b) return false;                   /* cache full: interpreter takes over */
         c->jit_link = NULL;
         jit_enter(c, g_mem, b);
         /* link the exit we left through to its (now compiled) target */
         void **slot = c->jit_link;
         u32 t = c->r[15];
-        if (slot && t - jt_lo < jt_words * 2 && !(t & 3) && !(c->cpsr & FLAG_T) && !c->exit_loop) {
-            void *nb = block_for(t);
+        bool tt = c->cpsr & FLAG_T;
+        if (slot && t - jt_lo < jt_words * 2 && !(t & (tt ? 1 : 3)) && !c->exit_loop) {
+            void *nb = block_for(t, tt);
             if (nb) __atomic_store_n(slot, nb, __ATOMIC_RELEASE);
         }
     }
