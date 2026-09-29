@@ -110,6 +110,25 @@ static void rr3_input(cpu_t *c)
     }
 }
 
+/* The 3D scene renders at the device profile's scale (0.8 offline) and is stretched to the screen.
+ * Both readers of that setting load it with one vldr; replace it with vmov.f32 #1.0 (native).
+ * RR2_RR3_SCALE=game keeps the game's own scale. */
+static void patch_scene_scale(void)
+{
+    static const struct { const char *sym; u32 off, orig, repl; } p[] = {
+        { "_ZN7CGlobal20game_get3DSceneScaleEv", 0x44, 0xED900A19u, 0xEEB70A00u },  /* vldr s0, [r0, #100] */
+        { "_ZN7CGlobal19game_setScreenScaleEv", 0x58, 0xED908A19u, 0xEEB78A00u },   /* vldr s16, [r0, #100] */
+    };
+    const char *e = getenv("RR2_RR3_SCALE");
+    if (e && !strcmp(e, "game")) return;
+    for (unsigned i = 0; i < sizeof(p) / sizeof(p[0]); i++) {
+        u32 a = elf_lookup(p[i].sym);
+        if (!a || ld32((a & ~1u) + p[i].off) != p[i].orig) { LOG("[rr3] scene scale patch: %s not as expected, skipped\n", p[i].sym); return; }
+    }
+    for (unsigned i = 0; i < sizeof(p) / sizeof(p[0]); i++) st32((elf_lookup(p[i].sym) & ~1u) + p[i].off, p[i].repl);
+    LOG("[rr3] 3D scene at native resolution\n");
+}
+
 int rr3_main(const char *so_path)
 {
     G.game = 3;
@@ -117,6 +136,7 @@ int rr3_main(const char *so_path)
     LOG("[rr3] loading %s (data %s, saves %s)\n", so_path, G.assets_dir, G.save_dir);
     if (elf_load(&G, so_path) != 0) fatal("failed to load %s", so_path);
     if (getenv("RR2_STUBS")) { extern void hle_dump_stubs(void); hle_dump_stubs(); }
+    patch_scene_scale();
     cpu_icache_reset();
     thumb_it_reset();
     if (getenv("RR2_NOJIT")) g_jit = 0;

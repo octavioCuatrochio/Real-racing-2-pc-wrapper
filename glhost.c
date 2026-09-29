@@ -638,8 +638,24 @@ static void h_glTexImage2Dchk(cpu_t *c)
     { u32 bpp = A(7) == 0x1401 ? (A(6) == 0x1908 ? 4 : A(6) == 0x1907 ? 3 : A(6) == 0x190A ? 2 : 1) : 2;
       g_tex_bytes += (u64)I(3) * I(4) * bpp; g_tex_uploads++; }
     tex_note_upload(I(1));
+    { extern long g_frame; if (!P(8) && getenv("RR2_FBO_TRACE")) LOG("[fbo] empty texture %dx%d fmt %04x type %04x (frame %ld)\n", I(3), I(4), A(6), A(7), g_frame); }
     p_glTexImage2Dx(A(0), I(1), I(2), I(3), I(4), I(5), A(6), A(7), P(8));
     GLCHK("glTexImage2D");
+}
+/* RR2_FBO_TRACE=1: log render target allocations and each new viewport size */
+extern long g_frame;
+static void h_glRenderbufferStorageT(cpu_t *c)
+{
+    LOG("[fbo] renderbuffer %04x %dx%d (frame %ld)\n", A(1), I(2), I(3), g_frame);
+    p_glRenderbufferStorage(A(0), A(1), I(2), I(3));
+}
+static void h_glViewportT(cpu_t *c)
+{
+    static int seen[64][2], n;
+    int w = I(2), h = I(3), k;
+    for (k = 0; k < n && (seen[k][0] != w || seen[k][1] != h); k++) {}
+    if (k == n && n < 64) { seen[n][0] = w; seen[n][1] = h; n++; LOG("[fbo] new viewport %dx%d (frame %ld)\n", w, h, g_frame); }
+    p_glViewport(I(0), I(1), w, h);
 }
 /* ---- ATC -> S3TC transcode (same block size: 8 -> DXT1, 16 -> DXT3/DXT5) ---- */
 
@@ -906,6 +922,7 @@ bool glhost_init(void)
     hle_register("glCompileShader", h_glCompileShaderChk);
     *(void **)&p_glGetError2 = host_gl_proc("glGetError");
     hle_register("glTexImage2D", h_glTexImage2Dchk);
+    if (getenv("RR2_FBO_TRACE")) { hle_register("glRenderbufferStorage", h_glRenderbufferStorageT); hle_register("glViewport", h_glViewportT); }
     hle_register("glActiveTexture", t_glActiveTexture);
     hle_register("glBindTexture", t_glBindTexture);
     if (!getenv("RR2_NO_GLCACHE")) {
