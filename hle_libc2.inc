@@ -351,7 +351,10 @@ static void hle_inet_ntop(cpu_t *c)
 /* ---- libdl ---- */
 #define DL_HANDLE(i) (0xD1000000u + (u32)(i))
 static const char *const dl_names[] = { "libRealRacing3.so", "libNimble.so", "libfmodex.so", "libc++_shared.so",
-                                        "libc.so", "libm.so", "libGLESv2.so", "libGLESv3.so", "libEGL.so", "libdl.so", "liblog.so" };
+                                        "libc.so", "libm.so", "libGLESv2.so", "libGLESv3.so", "libEGL.so", "libdl.so", "liblog.so",
+                                        "libOpenSLES.so" };
+#define DL_OPENSL DL_HANDLE(11)
+u32 opensl_dlsym(const char *name);
 static __thread char dl_err[256];
 static void hle_dlopen(cpu_t *c)
 {
@@ -368,6 +371,7 @@ static void hle_dlsym(cpu_t *c)
 {
     const char *s = GSTR(harg(c,1));
     u32 h = harg(c,0), a = 0;
+    if (h == DL_OPENSL) { hret(c, opensl_dlsym(s)); return; }
     if (h >= DL_HANDLE(0) && h < DL_HANDLE(4)) a = elf_lookup_in(dl_names[h - DL_HANDLE(0)], s);
     if (!a) a = elf_lookup(s);
     if (!a && hle_has(s)) a = hle_bind(s);

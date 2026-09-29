@@ -107,6 +107,20 @@ static void hle_pthread_create(cpu_t *c)
     hret(c, 0);
 }
 
+/* a guest cpu (with its own stack) for a host thread that calls into guest code, e.g. audio callbacks */
+cpu_t *guest_cpu_for_host_thread(const char *name)
+{
+    gptr top = tstack_alloc(GUEST_TSTACK_SIZE);
+    if (!top) return NULL;
+    cpu_t *c = emu_new_cpu();
+    c->r[13] = top & ~7u;
+    c->stack_lo = top - GUEST_TSTACK_SIZE;
+    c->stack_hi = top;
+    snprintf(c->name, sizeof(c->name), "%s", name);
+    tls_cpu = c;
+    return c;
+}
+
 /* run guest fn on a fresh guest thread (e.g. Android's UI thread); *done set on return */
 typedef struct { cpu_t *cpu; u32 fn; int argc; u32 args[8]; volatile int *done; } async_call;
 static void *async_main(void *p)
