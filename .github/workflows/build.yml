@@ -64,9 +64,12 @@ jobs:
         shell: pwsh
         run: |
           Expand-Archive rr2emu-windows-x64.zip -DestinationPath .
-          $p = Start-Process -FilePath .\rr2emu-windows-x64\rr2emu.exe -ArgumentList '--selftest' -Wait -PassThru -NoNewWindow
+          $p = Start-Process -FilePath .\rr2emu-windows-x64\rr2emu.exe -ArgumentList '--selftest' -Wait -PassThru -NoNewWindow `
+               -RedirectStandardOutput out.txt -RedirectStandardError err.txt
+          Get-Content out.txt, err.txt
           if (Test-Path .\rr2emu-windows-x64\rr2emu.log) { Get-Content .\rr2emu-windows-x64\rr2emu.log }
           if ($p.ExitCode -ne 0) { exit 1 }
+          if (-not (Select-String -Path err.txt, out.txt -Pattern ' 0 failed' -Quiet)) { Write-Error 'self-test output missing'; exit 1 }
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')

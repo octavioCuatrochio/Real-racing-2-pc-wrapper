@@ -201,8 +201,12 @@ void win_init(void)
 {
     AddVectoredExceptionHandler(1, on_exception);
     timeBeginPeriod(1);                          /* the game's frame limiter sleeps in 1 ms steps */
-    /* GUI binary: log to the console that started us, else to rr2emu.log next to the exe */
-    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+    /* GUI binary: keep redirected output (pipes/files), else the console that started us, else rr2emu.log */
+    HANDLE eh = GetStdHandle(STD_ERROR_HANDLE);
+    DWORD et = eh && eh != INVALID_HANDLE_VALUE ? GetFileType(eh) : FILE_TYPE_UNKNOWN;
+    if (et == FILE_TYPE_PIPE || et == FILE_TYPE_DISK) {
+        /* already redirected by the caller */
+    } else if (AttachConsole(ATTACH_PARENT_PROCESS)) {
         freopen("CONOUT$", "w", stdout);
         freopen("CONOUT$", "w", stderr);
     } else if (GetStdHandle(STD_ERROR_HANDLE) == NULL || GetFileType(GetStdHandle(STD_ERROR_HANDLE)) == FILE_TYPE_UNKNOWN) {
