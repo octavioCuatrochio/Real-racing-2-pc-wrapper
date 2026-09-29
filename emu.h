@@ -49,7 +49,7 @@ extern u8 *g_mem;   /* base of the 4GB guest space */
 #define GUEST_HLE_DATA     0x08000000u   /* HLE data page zone (guest objects) */
 #define GUEST_MMAP_BASE    0x09000000u   /* guest mmap arena */
 #define GUEST_LIB_BASE     0x40000000u   /* .so load base */
-#define GUEST_HEAP_BASE    0x41000000u   /* malloc arena / brk */
+#define GUEST_HEAP_BASE    0x44000000u   /* malloc arena / brk (libraries below: 64MB) */
 #define GUEST_HEAP_MAX     0x5C000000u   /* TLSF heap limit */
 #define GUEST_SBRK_BASE    0x5C000000u   /* raw sbrk window, 64MB below thread stacks */
 #define GUEST_SBRK_MAX     0x60000000u
@@ -213,8 +213,10 @@ typedef struct emu {
     pthread_mutex_t threads_lock;
 
     /* options */
-    const char *assets_dir;
+    const char *assets_dir;         /* RR2: OBB data root; RR3: extracted data root (sdcard/, internal/, apk/) */
     const char *apk_assets_dir;
+    int   game;                     /* 2 = Real Racing 2, 3 = Real Racing 3 */
+    const char *save_dir;           /* write overlay ("./save" for RR2) */
     int   max_frames;
     int   width, height;
     int   headless, vsync, fullscreen, aniso;
@@ -231,7 +233,11 @@ extern __thread cpu_t *tls_cpu;
 
 int  elf_load(emu_t *e, const char *path);
 u32  elf_lookup(const char *name);       /* exported dynsym addr, 0 if none */
+u32  elf_lookup_in(const char *lib, const char *name);
+u32  elf_exidx_for(u32 pc, u32 *count);
+const char *elf_lib_of(u32 addr, u32 *base);
 void elf_run_init_array(cpu_t *c);
+bool elf_run_init_lib(cpu_t *c, const char *name);
 void elf_run_fini_array(cpu_t *c);
 
 /* ---------------- HLE ---------------- */
@@ -240,6 +246,7 @@ typedef void (*hle_fn)(cpu_t *c);
 
 void hle_init(void);
 u32  hle_bind(const char *name);    /* slot address for an import (creates stub if unknown) */
+bool hle_has(const char *name);     /* a real implementation is registered */
 void hle_register(const char *name, hle_fn fn);
 const char *hle_slot_name(u32 pc);
 gptr hle_data_alloc(u32 size, u32 align);  /* carve guest memory in HLE data zone */
@@ -287,6 +294,8 @@ u32  jni_activity(void);  /* the MainActivity jobject */
 u32  jni_object(const char *cls);
 u32  jni_class(const char *name);
 u32  jni_take_video_completion(void);
+void jni_push_frame(void);           /* local reference frame around a host->guest native call */
+void jni_pop_frame(void);
 u32  jni_string(const char *s);
 void gles_tick_frame(void); /* FPS meter hook from eglSwapBuffers-equivalents */
 
@@ -312,6 +321,7 @@ int   host_menu_poll(int wait_ms, menu_event_t *ev);
 void  host_text_input(int on);
 float glhost_max_aniso(void);
 bool  launcher_run(const char **so_path);
+int   rr3_main(const char *so_path);
 void  patches_setup(void);
 int   inflate_raw(const u8 *in, size_t n, u8 *out, size_t outn);
 void  patch_svc(cpu_t *c, u32 id);

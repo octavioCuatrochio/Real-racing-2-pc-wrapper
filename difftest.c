@@ -341,7 +341,11 @@ int difftest_main(int argc, char **argv)
         ran++;
         if (!run_ours(c, &so, pc, thumb, n)) {
             uc_mem_read(uc, DT_CODE, g2h(DT_CODE), 0x10000);
-            if (!strncmp(g_trap_msg, "undefined", 9) || !strncmp(g_trap_msg, "bkpt", 4) || strstr(g_trap_msg, "empty list")) { undefs++; continue; }
+            if (!strncmp(g_trap_msg, "undefined", 9) || !strncmp(g_trap_msg, "bkpt", 4) || strstr(g_trap_msg, "empty list")) {
+                undefs++;
+                if (getenv("DT_UNDEF") && undefs <= 60) LOG("UNDEF %-5s %08x\n", k, insn);
+                continue;
+            }
             traps++;
             if (traps <= 40) LOG("TRAP %-5s %08x: %s\n", k, insn, g_trap_msg);
             continue;

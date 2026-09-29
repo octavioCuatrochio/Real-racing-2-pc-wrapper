@@ -361,6 +361,10 @@ static void h_glGetString(cpu_t *c)
     const GLchar *s = p_glGetString(name);
     if (g_gl_desktop && name == 0x1F02) s = "OpenGL ES 2.0 rr2emu (desktop GL)";   /* the game expects ES strings */
     if (g_gl_desktop && name == 0x8B8C) s = "OpenGL ES GLSL ES 1.00";
+    if (G.game == 3 && name == 0x1F00) s = "Qualcomm";                  /* RR3 chooses ATC data for Adreno */
+    if (G.game == 3 && name == 0x1F01) s = "Adreno (TM) 540";
+    if (G.game == 3 && name == 0x1F02) s = "OpenGL ES 2.0 V@269.0 (rr2emu)";   /* keep RR3 on its ES2 renderer */
+    if (G.game == 3 && name == 0x8B8C) s = "OpenGL ES GLSL ES 1.00";
     if (name == 0x1F03 && s) {                     /* advertise the ATC we emulate */
         static char *ext;
         if (!ext) {
@@ -378,6 +382,7 @@ static void h_glGetIntegerv(cpu_t *c)
     GLenum pn = A(0);
     gptr out = A(1);
     GLint n = 0;
+    if (pn == 0x87FE) { st32(out, 0); return; }    /* NUM_PROGRAM_BINARY_FORMATS: none */
     if (pn == 0x86A2) {                            /* NUM_COMPRESSED_TEXTURE_FORMATS */
         p_glGetIntegerv(pn, &n);
         st32(out, (u32)(n + 3));
@@ -877,6 +882,7 @@ static void *es_fallback(const char *n)
     return NULL;
 }
 
+void glhost_init_extras(void);
 bool glhost_init(void)
 {
 #define X(n, r, params, call) \
@@ -941,5 +947,63 @@ bool glhost_init(void)
     const char *ext = p_glGetString(0x1F03);
     g_s3tc = ext && strstr(ext, "GL_EXT_texture_compression_s3tc") && !getenv("RR2_NO_S3TC");
     LOG("[gl] ATC textures -> %s\n", g_s3tc ? "S3TC (transcoded, same size)" : "RGBA8 (decoded)");
+    glhost_init_extras();
     return true;
+}
+
+/* ---- GLES3 / extension entry points RR3 looks up: VAOs mapped to what the host has ---- */
+static void (*p_vao_gen)(GLsizei, GLuint *), (*p_vao_bind)(GLuint), (*p_vao_del)(GLsizei, const GLuint *);
+static GLboolean (*p_vao_is)(GLuint);
+static void *gl_first(const char *a, const char *b, const char *c)
+{
+    void *f = host_gl_proc(a);
+    if (!f && b) f = host_gl_proc(b);
+    if (!f && c) f = host_gl_proc(c);
+    return f;
+}
+static void h_vao_gen(cpu_t *c)  { if (p_vao_gen) p_vao_gen(I(0), P(1)); }
+static void h_vao_bind(cpu_t *c) { if (p_vao_bind) p_vao_bind(A(0)); }
+static void h_vao_del(cpu_t *c)  { if (p_vao_del) p_vao_del(I(0), P(1)); }
+static void h_vao_is(cpu_t *c)   { RET(p_vao_is ? p_vao_is(A(0)) : 0); }
+static void h_nop(cpu_t *c)      { (void)c; }
+static void h_get_program_binary(cpu_t *c) { if (A(2)) st32(A(2), 0); }   /* length 0: no binaries */
+void glhost_init_extras(void)
+{
+    *(void **)&p_vao_gen = gl_first("glGenVertexArrays", "glGenVertexArraysOES", "glGenVertexArraysAPPLE");
+    *(void **)&p_vao_bind = gl_first("glBindVertexArray", "glBindVertexArrayOES", "glBindVertexArrayAPPLE");
+    *(void **)&p_vao_del = gl_first("glDeleteVertexArrays", "glDeleteVertexArraysOES", "glDeleteVertexArraysAPPLE");
+    *(void **)&p_vao_is = gl_first("glIsVertexArray", "glIsVertexArrayOES", "glIsVertexArrayAPPLE");
+    static const char *const sfx[] = { "", "OES" };
+    for (int i = 0; i < 2; i++) {
+        char n[64];
+        snprintf(n, sizeof(n), "glGenVertexArrays%s", sfx[i]);    hle_register(strdup(n), h_vao_gen);
+        snprintf(n, sizeof(n), "glBindVertexArray%s", sfx[i]);    hle_register(strdup(n), h_vao_bind);
+        snprintf(n, sizeof(n), "glDeleteVertexArrays%s", sfx[i]); hle_register(strdup(n), h_vao_del);
+        snprintf(n, sizeof(n), "glIsVertexArray%s", sfx[i]);      hle_register(strdup(n), h_vao_is);
+        snprintf(n, sizeof(n), "glGetProgramBinary%s", sfx[i]);   hle_register(strdup(n), h_get_program_binary);
+        snprintf(n, sizeof(n), "glProgramBinary%s", sfx[i]);      hle_register(strdup(n), h_nop);
+    }
+    hle_register("glProgramParameteri", h_nop);
+    LOG("[gl] vertex array objects: %s\n", p_vao_gen ? "host" : "unavailable (no-op)");
+}
+
+/* Java-side text textures (RR3 GlyphVector): create (tex = 0) or update a texture from host pixels.
+ * fmt: GL_RGBA (RGBA8) or GL_LUMINANCE (8-bit). The bind cache stays consistent. Headless: fake names. */
+u32 glhost_text_texture(u32 tex, int w, int h, const u8 *px, u32 fmt)
+{
+    static u32 fake = 0x70000000u;
+    if (!p_glGenTextures || !p_glBindTexture) return tex ? tex : fake++;
+    GLuint t = tex;
+    if (!t) p_glGenTextures(1, &t);
+    p_glBindTexture(0x0DE1, t);
+    p_glPixelStorei(0x0CF5, 1);                                   /* UNPACK_ALIGNMENT */
+    if (!tex) {
+        p_glTexParameteri(0x0DE1, 0x2801, 0x2601);                /* MIN_FILTER LINEAR */
+        p_glTexParameteri(0x0DE1, 0x2800, 0x2601);
+        p_glTexParameteri(0x0DE1, 0x2802, 0x812F);                /* CLAMP_TO_EDGE */
+        p_glTexParameteri(0x0DE1, 0x2803, 0x812F);
+        p_glTexImage2D(0x0DE1, 0, (GLint)fmt, w, h, 0, fmt, 0x1401, px);
+    } else p_glTexSubImage2D(0x0DE1, 0, 0, 0, w, h, fmt, 0x1401, px);
+    p_glBindTexture(0x0DE1, tex_bound[tex_unit]);                 /* what the game believes is bound */
+    return t;
 }

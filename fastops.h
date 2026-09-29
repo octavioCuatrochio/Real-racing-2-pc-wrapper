@@ -308,12 +308,13 @@ static inline JITCALL void stm_ia_wb(cpu_t *c, const di_t *d)
 
 
 /* ---- Thumb-only ops (thumb.c) ---- */
-void arm7_excl_at(cpu_t *c, u32 op, u32 addr, u32 rd, u32 rt);
+void arm7_excl_at(cpu_t *c, u32 op, u32 addr, u32 rd, u32 rt, u32 rt2);
 /* BranchWritePC in Thumb: stays in Thumb, bit0 ignored */
 static inline JITCALL void t_bwpc(cpu_t *c, const di_t *d)   { u32 t = c->r[d->rm] & ~1u; ring_push(c, t); c->r[15] = t; }
 static inline JITCALL void t_add_pc(cpu_t *c, const di_t *d) { u32 t = (d->a + c->r[d->rm]) & ~1u; ring_push(c, t); c->r[15] = t; }
 /* blx imm (Thumb -> ARM): d->a = ARM target, d->b = return | 1 */
 static inline JITCALL void t_blxi(cpu_t *c, const di_t *d)   { ring_push(c, d->a); c->r[14] = d->b; c->cpsr &= ~FLAG_T; c->r[15] = d->a; }
+static inline JITCALL void t_bx_pc(cpu_t *c, const di_t *d) { ring_push(c, d->a); c->cpsr &= ~FLAG_T; c->r[15] = d->a; }   /* bx pc: to ARM */
 static inline JITCALL void t_cbz(cpu_t *c, const di_t *d)    { if (!c->r[d->rn]) c->r[15] = d->a; }
 static inline JITCALL void t_cbnz(cpu_t *c, const di_t *d)   { if (c->r[d->rn]) c->r[15] = d->a; }
 /* table branch: d->a = pc+4 (branch base, also the value of pc as rn), d->b = 1 halfword table */
@@ -361,8 +362,8 @@ static inline JITCALL void t_ls_hreg(cpu_t *c, const di_t *d)
     switch (d->b >> 4) { case 0: st16(ea, (u16)c->r[d->rd]); break; case 1: c->r[d->rd] = ld16(ea); break;
                          case 2: c->r[d->rd] = (u32)(s32)(s8)ld8(ea); break; default: c->r[d->rd] = (u32)(s32)(s16)ld16(ea); break; }
 }
-/* ldrex/strex with an offset: d->b = ARM op (bits 23-20), d->a = offset, d->rd / d->rm as the ARM fields */
-static inline JITCALL void t_excl(cpu_t *c, const di_t *d) { arm7_excl_at(c, d->b, c->r[d->rn] + d->a, d->rd, d->rm); }
+/* ldrex/strex: d->b = ARM op (bits 23-20) | rt2 << 8, d->a = offset, d->rd / d->rm as the ARM fields */
+static inline JITCALL void t_excl(cpu_t *c, const di_t *d) { arm7_excl_at(c, d->b & 0xF, c->r[d->rn] + d->a, d->rd, d->rm, d->b >> 8); }
 
 /* X-macro list of every fast op. Order defines the op ids. */
 #define DP_OPS(X, opc) X(dp_##opc##_0i) X(dp_##opc##_1i) X(dp_##opc##_0r) X(dp_##opc##_1r) X(dp_##opc##_0s) X(dp_##opc##_1s)
@@ -390,7 +391,7 @@ static inline JITCALL void t_excl(cpu_t *c, const di_t *d) { arm7_excl_at(c, d->
     X(vldm_s_ia) X(vstm_s_ia) X(vldm_s_db) X(vstm_s_db) X(vldm_d_ia) X(vstm_d_ia) X(vldm_d_db) X(vstm_d_db) \
     X(ldrd_i) X(strd_i) X(ldrd_r) X(strd_r) X(umull_) X(smull_) X(umlal_) X(smlal_) \
     X(ldr_pcreg) X(vnmls_s) X(vnmla_s) X(br_blx) X(clz_) X(ldm_ia) X(stm_ia) X(stm_ia_wb) \
-    X(t_bwpc) X(t_add_pc) X(t_blxi) X(t_cbz) X(t_cbnz) X(t_tbb) X(t_orn) X(t_ld_lit) X(t_ldrd) X(t_strd) X(t_ls_hreg) X(t_excl)
+    X(t_bwpc) X(t_add_pc) X(t_blxi) X(t_bx_pc) X(t_cbz) X(t_cbnz) X(t_tbb) X(t_orn) X(t_ld_lit) X(t_ldrd) X(t_strd) X(t_ls_hreg) X(t_excl)
 
 enum {
     OP_decode, OP_generic, OP_hook,

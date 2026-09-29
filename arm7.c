@@ -248,20 +248,22 @@ void arm7_mls_umaal(cpu_t *c, u32 insn)
 
 /* ---- exclusives: one global monitor address per cpu; strex succeeds if armed on the same address ---- */
 static pthread_mutex_t excl_lock = PTHREAD_MUTEX_INITIALIZER;
-void arm7_excl_at(cpu_t *c, u32 op, u32 a, u32 rd, u32 rt);
+void arm7_excl_at(cpu_t *c, u32 op, u32 a, u32 rd, u32 rt, u32 rt2);
 void arm7_excl(cpu_t *c, u32 insn)
 {
-    arm7_excl_at(c, (insn >> 20) & 0xF, c->r[(insn >> 16) & 0xF], (insn >> 12) & 0xF, insn & 0xF);
+    u32 op = (insn >> 20) & 0xF, rd = (insn >> 12) & 0xF, rt = insn & 0xF;
+    arm7_excl_at(c, op, c->r[(insn >> 16) & 0xF], rd, rt, (op & 1 ? rd : rt) + 1);
 }
 
-/* op: 8 strex 9 ldrex A strexd B ldrexd C strexb D ldrexb E strexh F ldrexh; rd = loaded / status reg, rt = stored */
-void arm7_excl_at(cpu_t *c, u32 op, u32 a, u32 rd, u32 rt)
+/* op: 8 strex 9 ldrex A strexd B ldrexd C strexb D ldrexb E strexh F ldrexh; rd = loaded / status reg, rt = stored,
+   rt2 = second register of the doubleword forms */
+void arm7_excl_at(cpu_t *c, u32 op, u32 a, u32 rd, u32 rt, u32 rt2)
 {
     if (op & 1) {
         c->excl_addr = a;
         switch (op) {
         case 0x9: c->r[rd] = ld32(a); break;
-        case 0xB: c->r[rd] = ld32(a); c->r[rd + 1] = ld32(a + 4); break;
+        case 0xB: { u32 lo = ld32(a), hi = ld32(a + 4); c->r[rd] = lo; c->r[rt2] = hi; break; }
         case 0xD: c->r[rd] = ld8(a); break;
         default:  c->r[rd] = ld16(a); break;
         }
@@ -273,7 +275,7 @@ void arm7_excl_at(cpu_t *c, u32 op, u32 a, u32 rd, u32 rt)
     if (ok) {
         switch (op) {
         case 0x8: st32(a, c->r[rt]); break;
-        case 0xA: st32(a, c->r[rt]); st32(a + 4, c->r[rt + 1]); break;
+        case 0xA: st32(a, c->r[rt]); st32(a + 4, c->r[rt2]); break;
         case 0xC: st8(a, (u8)c->r[rt]); break;
         default:  st16(a, (u16)c->r[rt]); break;
         }

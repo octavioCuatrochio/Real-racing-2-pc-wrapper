@@ -49,26 +49,66 @@ static const char *vfs_xlate_locked(const char *gpath, int for_write)
     static char out[1024];
     char path[1024];
     const char *tail;
+    char t3[1024];
+    const char *save = G.save_dir ? G.save_dir : "./save";
 
     if (gpath[0] != '/') {
         snprintf(path, sizeof(path), "%s/%s", g_cwd, gpath);
         gpath = path;
     }
-    const char *anchor = strstr(gpath, "com.ea.game.realracing2");
-    if (anchor) tail = anchor;
-    else if (!strncmp(gpath, "/sdcard/", 8)) tail = gpath + 8;
-    else if (!strncmp(gpath, "/mnt/sdcard/", 12)) tail = gpath + 12;
-    else if (!strncmp(gpath, "/data/data/", 11)) tail = gpath + 11;
-    else tail = gpath + 1;
+    if (G.game == 3) {
+        /* RR3: external app data -> sdcard/, internal app data -> internal/, anything else -> other/ */
+        const char *pkg = "com.ea.games.r3_row";
+        const char *e = strstr(gpath, "Android/data/com.ea.games.r3_row");
+        const char *i = strstr(gpath, "/data/data/com.ea.games.r3_row");
+        if (!i) i = strstr(gpath, "/data/user/0/com.ea.games.r3_row");
+        const char *ap = strstr(gpath, "/data/app/com.ea.games.r3_row");
+        if (ap) ap = strchr(ap + 10, '/');                /* after "/data/app/<pkg>-N" */
+        if (e) snprintf(t3, sizeof(t3), "sdcard%s", e + strlen("Android/data/") + strlen(pkg));
+        else if (ap) snprintf(t3, sizeof(t3), "apk%s", ap);
+        else if (i) snprintf(t3, sizeof(t3), "internal%s", strstr(i, pkg) + strlen(pkg));
+        else snprintf(t3, sizeof(t3), "other%s", gpath);
+        tail = t3;
+    } else {
+        const char *anchor = strstr(gpath, "com.ea.game.realracing2");
+        if (anchor) tail = anchor;
+        else if (!strncmp(gpath, "/sdcard/", 8)) tail = gpath + 8;
+        else if (!strncmp(gpath, "/mnt/sdcard/", 12)) tail = gpath + 12;
+        else if (!strncmp(gpath, "/data/data/", 11)) tail = gpath + 11;
+        else tail = gpath + 1;
+    }
 
     if (strstr(tail, "..")) {
-        snprintf(out, sizeof(out), "./save/_invalid_");
+        snprintf(out, sizeof(out), "%s/_invalid_", save);
         return out;
     }
-    snprintf(out, sizeof(out), "./save/%s", tail);
+    snprintf(out, sizeof(out), "%s/%s", save, tail);
     if (!for_write && access(out, F_OK) != 0)
         snprintf(out, sizeof(out), "%s/%s", G.assets_dir, tail);
     return out;
+}
+
+/* read-only base location of a guest path (directory merging), or NULL */
+const char *vfs_base_path(const char *gpath, char *buf, size_t n);
+const char *vfs_base_path(const char *gpath, char *buf, size_t n)
+{
+    pthread_mutex_lock(&vfs_lock);
+    const char *o = vfs_xlate_locked(gpath, 1);
+    const char *save = G.save_dir ? G.save_dir : "./save";
+    size_t sl = strlen(save);
+    int ok = !strncmp(o, save, sl) && o[sl] == '/';
+    if (ok) snprintf(buf, n, "%s/%s", G.assets_dir, o + sl + 1);
+    pthread_mutex_unlock(&vfs_lock);
+    return ok ? buf : NULL;
+}
+
+/* host path for a guest path, read access (malloc'd) */
+char *vfs_host_path(const char *gpath)
+{
+    pthread_mutex_lock(&vfs_lock);
+    char *r = strdup(vfs_xlate_locked(gpath, 0));
+    pthread_mutex_unlock(&vfs_lock);
+    return r;
 }
 
 volatile int g_hide_next_tex;
@@ -812,6 +852,13 @@ static void hle_mkdir(cpu_t *c)
     const char *host = vfs_xlate(GSTR(harg(c,0)), 1);
     vfs_mkdirs(host);
     int r = emu_mkdir(host, (int)harg(c,1));
+    if (r) {                                       /* a directory only in the read-only data root exists too */
+        char b[1200]; struct stat st;
+        const char *base = vfs_base_path(GSTR(harg(c,0)), b, sizeof(b));
+        int e = errno;
+        if (e != EEXIST && base && !stat(base, &st)) e = EEXIST;
+        guest_errno_set(c, e == EEXIST ? 17 : e == ENOENT ? 2 : e);
+    }
     free((void *)host);
     hret(c, (u32)r);
 }
@@ -862,14 +909,19 @@ static void hle_chmod(cpu_t *c)  { hret(c, 0); }
 static void hle_utime(cpu_t *c)  { hret(c, 0); }
 static void hle_statfs(cpu_t *c)
 {
-    /* Bionic statfs: fake a big writable fs */
+    /* Bionic 32-bit struct statfs (84 bytes): type, bsize, u64 blocks/bfree/bavail/files/ffree,
+     * fsid[2], namelen, frsize, flags, spare[4]. Fake a 64GB fs with 32GB free */
     gptr out = harg(c,1);
-    memset(g2h(out), 0, 128);
+    memset(g2h(out), 0, 84);
     st32(out + 0, 0xEF53);          /* f_type */
     st32(out + 4, 4096);            /* f_bsize */
-    st32(out + 8, 0x1000000);       /* f_blocks (64) */
+    st32(out + 8, 0x1000000);       /* f_blocks */
     st32(out + 16, 0x0800000);      /* f_bfree */
     st32(out + 24, 0x0800000);      /* f_bavail */
+    st32(out + 32, 0x100000);       /* f_files */
+    st32(out + 40, 0x80000);        /* f_ffree */
+    st32(out + 56, 255);            /* f_namelen */
+    st32(out + 60, 4096);           /* f_frsize */
     hret(c, 0);
 }
 
@@ -885,18 +937,28 @@ static void hle_opendir(cpu_t *c)
     DIR *d = opendir(host);
     VLOG(1, "[vfs] opendir(%s) -> %s = %p\n", GSTR(harg(c,0)), host, (void *)d);
     if (!d) { free((void *)host); guest_errno_set(c, ENOENT); hret(c, 0); return; }
-    if (g_ndirs >= MAX_GDIRS) { free((void *)host); closedir(d); hret(c, 0); return; }
-    g_dirs[g_ndirs] = d;
-    g_dir_paths[g_ndirs] = (char *)host;
-    hret(c, (u32)(++g_ndirs));   /* 1-based index */
+    int slot = -1;
+    for (int i = 0; i < g_ndirs; i++) if (!g_dirs[i]) { slot = i; break; }
+    if (slot < 0) {
+        if (g_ndirs >= MAX_GDIRS) { LOG("[vfs] opendir: too many open directories\n"); free((void *)host); closedir(d); hret(c, 0); return; }
+        slot = g_ndirs++;
+    }
+    g_dirs[slot] = d;
+    g_dir_paths[slot] = (char *)host;
+    hret(c, (u32)(slot + 1));   /* 1-based index */
 }
 static void hle_closedir(cpu_t *c)
 {
     u32 id = harg(c,0);
-    if (id >= 1 && id <= (u32)g_ndirs) closedir(g_dirs[id - 1]);
+    if (id >= 1 && id <= (u32)g_ndirs && g_dirs[id - 1]) {
+        closedir(g_dirs[id - 1]);
+        g_dirs[id - 1] = NULL;
+        free(g_dir_paths[id - 1]);
+        g_dir_paths[id - 1] = NULL;
+    }
     hret(c, 0);
 }
-/* Bionic dirent: u64 d_ino; long d_off; u16 d_reclen; u8 d_type; char d_name[256] */
+/* Bionic dirent (__DIRENT64_BODY, also on 32-bit): u64 d_ino; s64 d_off; u16 d_reclen; u8 d_type; char d_name[256] */
 static u8 dirent_type(u32 id, const struct dirent *de)
 {
 #ifdef _WIN32
@@ -912,14 +974,14 @@ static u8 dirent_type(u32 id, const struct dirent *de)
 }
 static u32 marshal_dirent(gptr out, const struct dirent *de, u8 type)
 {
-    u32 reclen = 8 + 4 + 2 + 1 + 256;
+    u32 reclen = 280;               /* 8 + 8 + 2 + 1 + 256, 8-aligned */
     memset(g2h(out), 0, reclen);
     st32(out + 0, (u32)de->d_ino);
-    st32(out + 4, 0);
-    st32(out + 8, 0);               /* d_off */
-    st16(out + 12, (u16)reclen);
-    st8(out + 14, type);
-    snprintf(g2h(out + 15), 256, "%s", de->d_name);
+    st32(out + 4, (u32)((u64)de->d_ino >> 32));
+    st32(out + 8, 0); st32(out + 12, 0);          /* d_off */
+    st16(out + 16, (u16)reclen);
+    st8(out + 18, type);
+    snprintf(g2h(out + 19), 256, "%s", de->d_name);
     return reclen;
 }
 static void hle_readdir(cpu_t *c)
@@ -929,7 +991,8 @@ static void hle_readdir(cpu_t *c)
     u32 id = harg(c,0);
     if (id < 1 || id > (u32)g_ndirs) { guest_errno_set(c, EBADF); hret(c, 0); return; }
     pthread_mutex_lock(&rd_lock);
-    struct dirent *de = readdir(g_dirs[id - 1]);
+    struct dirent *de = g_dirs[id - 1] ? readdir(g_dirs[id - 1]) : NULL;
+    VLOG(2, "[vfs] readdir(%u) -> %s\n", id, de ? de->d_name : "(end)");
     if (!de) { pthread_mutex_unlock(&rd_lock); hret(c, 0); return; }
     if (!ent.buf) ent.buf = hle_data_alloc(512, 8);
     marshal_dirent(ent.buf, de, dirent_type(id, de));
@@ -943,7 +1006,8 @@ static void hle_readdir_r(cpu_t *c)
     if (id < 1 || id > (u32)g_ndirs) { st32(out, 0); hret(c, (u32)EBADF); return; }
     static pthread_mutex_t rd2_lock = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_lock(&rd2_lock);
-    struct dirent *de = readdir(g_dirs[id - 1]);
+    struct dirent *de = g_dirs[id - 1] ? readdir(g_dirs[id - 1]) : NULL;
+    VLOG(2, "[vfs] readdir_r(%u) -> %s\n", id, de ? de->d_name : "(end)");
     if (de) {
         marshal_dirent(buf, de, dirent_type(id, de));
         st32(out, buf);
@@ -1026,21 +1090,31 @@ static void marshal_tm(gptr out, const struct tm *tm)
     if (!zone) { zone = hle_data_alloc(8, 4); strcpy(g2h(zone), "UTC"); }
     st32(out + 40, zone);
 }
+/* gmtime / localtime: one static struct tm per guest thread, like bionic's */
+static gptr tm_buf(cpu_t *c)
+{
+    static __thread gptr b;
+    (void)c;
+    if (!b) b = hle_data_alloc(64, 8);
+    return b;
+}
 static void hle_gmtime(cpu_t *c)
 {
     time_t t = (time_t)(s32)ld32(harg(c,0));
     struct tm tmv;
     gmtime_r(&t, &tmv);
-    marshal_tm(harg(c,1), &tmv);
-    hret(c, harg(c,1));
+    gptr o = tm_buf(c);
+    marshal_tm(o, &tmv);
+    hret(c, o);
 }
 static void hle_localtime(cpu_t *c)
 {
     time_t t = (time_t)(s32)ld32(harg(c,0));
     struct tm tmv;
     localtime_r(&t, &tmv);
-    marshal_tm(harg(c,1), &tmv);
-    hret(c, harg(c,1));
+    gptr o = tm_buf(c);
+    marshal_tm(o, &tmv);
+    hret(c, o);
 }
 static void hle_strftime(cpu_t *c)
 {
@@ -1213,7 +1287,7 @@ static void hle_android_log_write(cpu_t *c)
 
 gptr hle_data_object(const char *name)
 {
-    static gptr sf, guard, ctype, tolower_tab, toupper_tab, tzname_o, page_size_o;
+    static gptr sf, guard, ctype, tolower_tab, toupper_tab, tzname_o, page_size_o, timezone_o;
     static bool inited;
     if (!inited) {
         inited = true;
@@ -1254,7 +1328,9 @@ gptr hle_data_object(const char *name)
         st32(tzname_o, tz1); st32(tzname_o + 4, tz2);
         page_size_o = hle_data_alloc(4, 4);
         st32(page_size_o, 4096);
+        timezone_o = hle_data_alloc(4, 4);
     }
+    if (!strcmp(name, "timezone")) return timezone_o;
     if (!strcmp(name, "__sF")) return sf;
     if (!strcmp(name, "__stack_chk_guard")) return guard;
     if (!strcmp(name, "_ctype_")) return ctype;
@@ -1308,6 +1384,8 @@ static void hle_drand48(cpu_t *c)
     u64 b; memcpy(&b, &d, 8);
     hret64(c, b);
 }
+
+#include "hle_libc2.inc"
 
 void libc_init(void)
 {
@@ -1445,4 +1523,5 @@ void libc_init(void)
     hle_register("__android_log_print", hle_android_log_print);
     hle_register("__android_log_vprint", hle_android_log_vprint);
     hle_register("__android_log_write", hle_android_log_write);
+    libc2_init();
 }

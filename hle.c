@@ -37,6 +37,14 @@ static void hle_stub(cpu_t *c)
     hret(c, 0);
 }
 
+/* a real implementation (not a stub) is registered under this name */
+bool hle_has(const char *name)
+{
+    for (int i = 1; i < hle_n; i++)
+        if (!strcmp(hle_names[i], name)) return hle_fns[i] != hle_stub;
+    return false;
+}
+
 /* used by the ELF loader: every imported symbol gets a slot address */
 u32 hle_bind(const char *name)
 {
@@ -56,6 +64,15 @@ u32 hle_bind(const char *name)
     pthread_mutex_unlock(&hle_lock);
     VLOG(1, "[hle] bound stub for unknown import: %s\n", name);
     return HLE_SLOT_BASE + idx * HLE_SLOT_STRIDE;
+}
+
+/* imports that are still bound to the log-and-return-0 stub */
+void hle_dump_stubs(void)
+{
+    int n = 0;
+    for (int i = 1; i < hle_n; i++)
+        if (hle_fns[i] == hle_stub) { LOG("%s%s", n % 8 ? " " : "\n[hle] stubs:", hle_names[i]); n++; }
+    LOG("\n[hle] %d imports have no implementation\n", n);
 }
 
 const char *hle_slot_name(u32 pc)

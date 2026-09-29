@@ -150,7 +150,10 @@ static void t16(ctx_t *x, u32 h)
                 via_arm(x, AL | 0xDu << 21 | rdn << 12 | rm);
                 return;
             default:                        /* bx / blx */
-                if (rm == 15) { undef(x, h); return; }
+                if (rm == 15) {
+                    if (h & 0x80) { undef(x, h); return; }
+                    d->a = (pc + 4) & ~3u; via_op(x, OP_t_bx_pc); return;
+                }
                 d->rm = (u8)rm;
                 if (h & 0x80) { d->b = (pc + 2) | 1; via_op(x, OP_br_blx); }
                 else via_op(x, OP_br_bx);
@@ -191,7 +194,7 @@ static void t16(ctx_t *x, u32 h)
         return;
     case 0x16: case 0x17: {                 /* miscellaneous */
         u32 op = (h >> 5) & 0x7F;
-        if ((op & 0x7C) == 0x00) {          /* add/sub sp, sp, #imm7 */
+        if ((op & 0x78) == 0x00) {          /* add/sub sp, sp, #imm7 */
             d->rd = 13; d->rn = 13; d->a = (h & 0x7F) * 4;
             via_op(x, DP_OP((h & 0x80) ? 2 : 4, 0));
             return;
@@ -482,7 +485,7 @@ static void t32_ldst_multi_dual(ctx_t *x, u32 h1, u32 h2)
     if (op1 == 1 && op2 == 0) {                            /* strexb/h/d: status = h2[3:0] */
         d->rn = (u8)rn; d->rd = (u8)(h2 & 15); d->rm = (u8)rt;
         if (op3 == 4) d->b = 0xC; else if (op3 == 5) d->b = 0xE;
-        else if (op3 == 7 && rt2 == rt + 1) d->b = 0xA;
+        else if (op3 == 7) d->b = 0xA | rt2 << 8;
         else { undef(x, h1 << 16 | h2); return; }
         via_op(x, OP_t_excl);
         return;
@@ -495,7 +498,7 @@ static void t32_ldst_multi_dual(ctx_t *x, u32 h1, u32 h2)
         }
         d->rn = (u8)rn; d->rd = (u8)rt;
         if (op3 == 4) d->b = 0xD; else if (op3 == 5) d->b = 0xF;
-        else if (op3 == 7 && rt2 == rt + 1) d->b = 0xB;
+        else if (op3 == 7) d->b = 0xB | rt2 << 8;
         else { undef(x, h1 << 16 | h2); return; }
         via_op(x, OP_t_excl);
         return;

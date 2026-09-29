@@ -39,6 +39,8 @@ typedef struct { cpu_t *cpu; u32 start; u32 arg; } gthread_boot;
 
 static void tls_run_destructors(cpu_t *c);
 
+/* join support: pthread_t = tid + 1; exit status per tid */
+static struct { volatile int done; u32 ret; u32 gen; } g_tjoin[1024];
 static void *gthread_main(void *p)
 {
     gthread_boot *b = p;
@@ -53,6 +55,7 @@ static void *gthread_main(void *p)
 
     c->thread_ret = c->r[0];
     tls_run_destructors(c);
+    if (c->tid >= 0 && c->tid < 1024) { g_tjoin[c->tid].ret = c->thread_ret; __atomic_store_n(&g_tjoin[c->tid].done, 1, __ATOMIC_RELEASE); }
     VLOG(1, "[thread] guest thread %d (%s) exited\n", c->tid, c->name);
     emu_free_cpu(c);
     return NULL;
@@ -81,6 +84,7 @@ static void hle_pthread_create(cpu_t *c)
     }
 
     cpu_t *nc = emu_new_cpu();
+    if (nc->tid >= 0 && nc->tid < 1024) g_tjoin[nc->tid].done = 0;
     nc->r[13] = stack_top & ~7u;
     nc->stack_lo = stack_top - stack_size;
     nc->stack_hi = stack_top;
@@ -143,10 +147,21 @@ static void hle_pthread_self(cpu_t *c) { hret(c, (u32)c->tid + 1); }
 static void hle_pthread_attr_init(cpu_t *c)
 {
     gptr a = harg(c, 0);
-    memset(g2h(a), 0, 32);
+    memset(g2h(a), 0, 24);          /* bionic 32-bit pthread_attr_t: 6 words */
     hret(c, 0);
 }
 static void hle_pthread_attr_destroy(cpu_t *c) { hret(c, 0); }
+static void hle_pthread_attr_setdetachstate(cpu_t *c) { gptr a = harg(c, 0); st32(a, (ld32(a) & ~1u) | (harg(c, 1) ? 1 : 0)); hret(c, 0); }
+static void hle_pthread_attr_getdetachstate(cpu_t *c) { st32(harg(c, 1), ld32(harg(c, 0)) & 1); hret(c, 0); }
+static void hle_pthread_detach(cpu_t *c) { hret(c, 0); }
+static void hle_pthread_join(cpu_t *c)
+{
+    u32 t = harg(c, 0) - 1;
+    if (t >= 1024) { hret(c, 3 /* ESRCH */); return; }
+    while (!__atomic_load_n(&g_tjoin[t].done, __ATOMIC_ACQUIRE)) usleep(500);
+    if (harg(c, 1)) st32(harg(c, 1), g_tjoin[t].ret);
+    hret(c, 0);
+}
 static void hle_pthread_attr_setstacksize(cpu_t *c)
 {
     gptr a = harg(c, 0);
@@ -170,7 +185,7 @@ static void hle_pthread_attr_getstack(cpu_t *c)
 static void hle_pthread_getattr_np(cpu_t *c)
 {
     gptr a = harg(c, 1);
-    memset(g2h(a), 0, 32);
+    memset(g2h(a), 0, 24);          /* bionic 32-bit pthread_attr_t: 6 words */
     st32(a + 4, c->stack_lo);
     st32(a + 8, c->stack_hi - c->stack_lo);
     hret(c, 0);
@@ -187,84 +202,101 @@ static void hle_pthread_getschedparam(cpu_t *c)
 /* mutexes / conds / sems (keyed by guest address, lazy init)         */
 /* ================================================================== */
 
-#define MAX_SYNC 1024
+/* Open-addressed tables keyed by the guest object's address. Lookups are lock-free (entries
+ * never move; the address is published after the host object is initialized); inserts and
+ * destroys take sync_lock. Destroy leaves a tombstone and keeps the host object alive, so a
+ * racing (buggy) user never touches freed memory. */
+#define SYNC_BITS 16
+#define SYNC_N (1u << SYNC_BITS)
+#define SYNC_DEAD 1u
 
-typedef struct { gptr addr; pthread_mutex_t m; int used; } gmutex;
-typedef struct { gptr addr; pthread_cond_t cv; int used; } gcond;
-typedef struct { gptr addr; sem_t s; int used; } gsem;
+typedef struct { volatile gptr addr; pthread_mutex_t m; } gmutex;
+typedef struct { volatile gptr addr; pthread_cond_t cv; } gcond;
+typedef struct { volatile gptr addr; sem_t s; } gsem;
 
-static gmutex g_mutexes[MAX_SYNC];
-static gcond  g_conds[MAX_SYNC];
-static gsem   g_sems[MAX_SYNC];
+static gmutex *g_mutexes;
+static gcond  *g_conds;
+static gsem   *g_sems;
 static pthread_mutex_t sync_lock = PTHREAD_MUTEX_INITIALIZER;
+static int     g_nsync[3];
 
-static pthread_mutex_t *mutex_for(gptr addr)
-{
-    pthread_mutex_lock(&sync_lock);
-    for (int i = 0; i < MAX_SYNC; i++)
-        if (g_mutexes[i].used && g_mutexes[i].addr == addr) {
-            pthread_mutex_unlock(&sync_lock);
-            return &g_mutexes[i].m;
-        }
-    for (int i = 0; i < MAX_SYNC; i++)
-        if (!g_mutexes[i].used) {
-            g_mutexes[i].used = 1;
-            g_mutexes[i].addr = addr;
-            pthread_mutex_init(&g_mutexes[i].m, NULL);
-            pthread_mutex_unlock(&sync_lock);
-            return &g_mutexes[i].m;
-        }
-    pthread_mutex_unlock(&sync_lock);
-    fatal("mutex table full");
+static inline u32 sync_hash(gptr a) { return (a * 2654435761u) >> (32 - SYNC_BITS); }
+
+#define SYNC_TABLE(kind, T, tab, field, init_expr, idx) \
+static T *kind##_slot(gptr addr, bool create, u32 bionic_word) \
+{ \
+    if (!tab) { \
+        pthread_mutex_lock(&sync_lock); \
+        if (!tab) tab = calloc(SYNC_N, sizeof(T)); \
+        pthread_mutex_unlock(&sync_lock); \
+    } \
+    u32 h = sync_hash(addr); \
+    for (u32 n = 0; n < SYNC_N; n++, h = (h + 1) & (SYNC_N - 1)) { \
+        gptr a = __atomic_load_n(&tab[h].addr, __ATOMIC_ACQUIRE); \
+        if (a == addr) return &tab[h]; \
+        if (!a) break; \
+    } \
+    if (!create) return NULL; \
+    pthread_mutex_lock(&sync_lock); \
+    h = sync_hash(addr); \
+    T *free_slot = NULL; \
+    for (u32 n = 0; n < SYNC_N; n++, h = (h + 1) & (SYNC_N - 1)) { \
+        gptr a = tab[h].addr; \
+        if (a == addr) { pthread_mutex_unlock(&sync_lock); return &tab[h]; } \
+        if (a == SYNC_DEAD && !free_slot) free_slot = &tab[h]; \
+        if (!a) { if (!free_slot) free_slot = &tab[h]; break; } \
+    } \
+    if (!free_slot || g_nsync[idx] >= (int)(SYNC_N * 3 / 4)) fatal(#kind " table full"); \
+    T *e = free_slot; \
+    if (e->addr != SYNC_DEAD) { init_expr; g_nsync[idx]++; } \
+    else { (void)bionic_word; } \
+    __atomic_store_n(&e->addr, addr, __ATOMIC_RELEASE); \
+    pthread_mutex_unlock(&sync_lock); \
+    return e; \
 }
 
-static pthread_cond_t *cond_for(gptr addr)
+static void mutex_host_init(pthread_mutex_t *m, u32 bionic_word)
 {
-    pthread_mutex_lock(&sync_lock);
-    for (int i = 0; i < MAX_SYNC; i++)
-        if (g_conds[i].used && g_conds[i].addr == addr) {
-            pthread_mutex_unlock(&sync_lock);
-            return &g_conds[i].cv;
-        }
-    for (int i = 0; i < MAX_SYNC; i++)
-        if (!g_conds[i].used) {
-            g_conds[i].used = 1;
-            g_conds[i].addr = addr;
-            pthread_cond_init(&g_conds[i].cv, NULL);
-            pthread_mutex_unlock(&sync_lock);
-            return &g_conds[i].cv;
-        }
-    pthread_mutex_unlock(&sync_lock);
-    fatal("cond table full");
+    /* Bionic mutex word bits 14-15: 0 normal, 0x4000 recursive, 0x8000 errorcheck (also static initializers) */
+    pthread_mutexattr_t ma;
+    pthread_mutexattr_init(&ma);
+    if ((bionic_word & 0xC000) == 0x4000) pthread_mutexattr_settype(&ma, PTHREAD_MUTEX_RECURSIVE);
+    else if ((bionic_word & 0xC000) == 0x8000) pthread_mutexattr_settype(&ma, PTHREAD_MUTEX_ERRORCHECK);
+    pthread_mutex_init(m, &ma);
+    pthread_mutexattr_destroy(&ma);
 }
+SYNC_TABLE(mutex, gmutex, g_mutexes, m, mutex_host_init(&e->m, bionic_word), 0)
+SYNC_TABLE(cond, gcond, g_conds, cv, pthread_cond_init(&e->cv, NULL), 1)
+SYNC_TABLE(sem, gsem, g_sems, s, sem_init(&e->s, 0, 0), 2)
 
-static sem_t *sem_for(gptr addr)
+static pthread_mutex_t *mutex_for(gptr addr) { return &mutex_slot(addr, true, ld32(addr))->m; }
+static pthread_cond_t *cond_for(gptr addr)   { return &cond_slot(addr, true, 0)->cv; }
+static sem_t *sem_for(gptr addr)             { gsem *e = sem_slot(addr, false, 0); return e ? &e->s : NULL; }
+
+static void sync_destroy(volatile gptr *slot)
 {
     pthread_mutex_lock(&sync_lock);
-    for (int i = 0; i < MAX_SYNC; i++)
-        if (g_sems[i].used && g_sems[i].addr == addr) {
-            pthread_mutex_unlock(&sync_lock);
-            return &g_sems[i].s;
-        }
+    __atomic_store_n(slot, SYNC_DEAD, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&sync_lock);
-    return NULL;   /* sems must be sem_init'd first */
 }
 
 static void hle_pthread_mutex_init(cpu_t *c)
 {
-    pthread_mutexattr_t ma, *map = NULL;
-    gptr attr = harg(c, 1);
-    if (attr) {
-        pthread_mutexattr_init(&ma);
-        if ((int)ld32(attr) == 1) pthread_mutexattr_settype(&ma, PTHREAD_MUTEX_RECURSIVE);
-        map = &ma;
-    }
-    pthread_mutex_t *m = mutex_for(harg(c, 0));
-    /* re-init in place if attr given (already default-inited by mutex_for) */
-    if (attr) pthread_mutex_init(m, map);
+    gptr m = harg(c, 0), attr = harg(c, 1);
+    u32 type = attr ? ld32(attr) : 0;                  /* our mutexattr: the type (0 normal 1 recursive 2 errorcheck) */
+    u32 word = type == 1 ? 0x4000 : type == 2 ? 0x8000 : 0;
+    st32(m, word);
+    gmutex *e = mutex_slot(m, false, 0);
+    if (e) { pthread_mutex_destroy(&e->m); mutex_host_init(&e->m, word); }   /* re-init */
+    else mutex_slot(m, true, word);
     hret(c, 0);
 }
-static void hle_pthread_mutex_destroy(cpu_t *c) { hret(c, 0); }
+static void hle_pthread_mutex_destroy(cpu_t *c)
+{
+    gmutex *e = mutex_slot(harg(c, 0), false, 0);
+    if (e) sync_destroy(&e->addr);
+    hret(c, 0);
+}
 static void hle_pthread_mutex_lock(cpu_t *c)    { pthread_mutex_lock(mutex_for(harg(c, 0))); hret(c, 0); }
 static void hle_pthread_mutex_trylock(cpu_t *c) { hret(c, (u32)pthread_mutex_trylock(mutex_for(harg(c, 0)))); }
 static void hle_pthread_mutex_unlock(cpu_t *c)  { pthread_mutex_unlock(mutex_for(harg(c, 0))); hret(c, 0); }
@@ -273,7 +305,12 @@ static void hle_pthread_mutexattr_settype(cpu_t *c) { st32(harg(c, 0), harg(c, 1
 static void hle_pthread_mutexattr_destroy(cpu_t *c) { hret(c, 0); }
 
 static void hle_pthread_cond_init(cpu_t *c)    { (void)cond_for(harg(c, 0)); hret(c, 0); }
-static void hle_pthread_cond_destroy(cpu_t *c) { hret(c, 0); }
+static void hle_pthread_cond_destroy(cpu_t *c)
+{
+    gcond *e = cond_slot(harg(c, 0), false, 0);
+    if (e) sync_destroy(&e->addr);
+    hret(c, 0);
+}
 static void hle_pthread_cond_signal(cpu_t *c)  { pthread_cond_signal(cond_for(harg(c, 0))); hret(c, 0); }
 static void hle_pthread_cond_broadcast(cpu_t *c) { pthread_cond_broadcast(cond_for(harg(c, 0))); hret(c, 0); }
 static void hle_pthread_cond_wait(cpu_t *c)
@@ -288,22 +325,24 @@ static void hle_pthread_cond_timedwait(cpu_t *c)
     hret(c, (u32)pthread_cond_timedwait(cond_for(harg(c, 0)), mutex_for(harg(c, 1)), &t));
 }
 
+void hle_sem_init_at(gptr addr, u32 val)
+{
+    gsem *e = sem_slot(addr, true, 0);
+    sem_destroy(&e->s);
+    sem_init(&e->s, 0, val);
+}
+
 static void hle_sem_init(cpu_t *c)
 {
-    gptr addr = harg(c, 0);
-    u32 val = harg(c, 2);
-    pthread_mutex_lock(&sync_lock);
-    for (int i = 0; i < MAX_SYNC; i++)
-        if (!g_sems[i].used) {
-            g_sems[i].used = 1;
-            g_sems[i].addr = addr;
-            sem_init(&g_sems[i].s, 0, val);
-            break;
-        }
-    pthread_mutex_unlock(&sync_lock);
+    hle_sem_init_at(harg(c, 0), harg(c, 2));
     hret(c, 0);
 }
-static void hle_sem_destroy(cpu_t *c) { hret(c, 0); }
+static void hle_sem_destroy(cpu_t *c)
+{
+    gsem *e = sem_slot(harg(c, 0), false, 0);
+    if (e) sync_destroy(&e->addr);
+    hret(c, 0);
+}
 static void hle_sem_wait(cpu_t *c)    { sem_wait(sem_for(harg(c, 0))); hret(c, 0); }
 static void hle_sem_trywait(cpu_t *c) { hret(c, (u32)sem_trywait(sem_for(harg(c, 0)))); }
 static void hle_sem_post(cpu_t *c)    { sem_post(sem_for(harg(c, 0))); hret(c, 0); }
@@ -478,6 +517,15 @@ static void hle_aeabi_atexit(cpu_t *c)
     hret(c, 0);
 }
 
+static void hle_pthread_equal(cpu_t *c) { hret(c, harg(c, 0) == harg(c, 1)); }
+
+/* __cxa_atexit(func, arg, dso) = __aeabi_atexit(arg, func, dso) */
+static void hle_cxa_atexit(cpu_t *c)
+{
+    u32 f = c->r[0]; c->r[0] = c->r[1]; c->r[1] = f;
+    hle_aeabi_atexit(c);
+}
+
 void sync_run_atexit(cpu_t *c)
 {
     for (int i = g_natexit - 1; i >= 0; i--)
@@ -487,8 +535,9 @@ void sync_run_atexit(cpu_t *c)
 static void hle_gnu_unwind_find_exidx(cpu_t *c)
 {
     gptr pcount = harg(c, 1);
-    if (pcount) st32(pcount, (u32)G.exidx_count);
-    hret(c, G.exidx_base);
+    u32 n, t = elf_exidx_for(harg(c, 0), &n);
+    if (pcount) st32(pcount, n);
+    hret(c, t);
 }
 static void hle_cxa_begin_cleanup(cpu_t *c)  { LOG_ONCE("[hle] __cxa_begin_cleanup stub\n"); hret(c, 0); }
 static void hle_cxa_call_unexpected(cpu_t *c) { emu_trap(c, "__cxa_call_unexpected"); }
@@ -527,10 +576,16 @@ static void hle_longjmp(cpu_t *c)
 void sync_init(void)
 {
     hle_register("pthread_create", hle_pthread_create);
+    hle_register("__cxa_atexit", hle_cxa_atexit);
+    hle_register("pthread_equal", hle_pthread_equal);
     hle_register("pthread_exit", hle_pthread_exit);
     hle_register("pthread_self", hle_pthread_self);
     hle_register("pthread_attr_init", hle_pthread_attr_init);
     hle_register("pthread_attr_destroy", hle_pthread_attr_destroy);
+    hle_register("pthread_attr_setdetachstate", hle_pthread_attr_setdetachstate);
+    hle_register("pthread_attr_getdetachstate", hle_pthread_attr_getdetachstate);
+    hle_register("pthread_detach", hle_pthread_detach);
+    hle_register("pthread_join", hle_pthread_join);
     hle_register("pthread_attr_setstacksize", hle_pthread_attr_setstacksize);
     hle_register("pthread_attr_setstack", hle_pthread_attr_setstack);
     hle_register("pthread_attr_getstack", hle_pthread_attr_getstack);

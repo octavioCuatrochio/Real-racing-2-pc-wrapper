@@ -183,6 +183,7 @@ void mem_init(void);
 extern int g_stats;
 void stats_dump(void);
 int  selftest_main(void);
+void frame_screenshots(long frame);
 int  difftest_main(int argc, char **argv);
 int  bench_main(void);
 
@@ -224,6 +225,14 @@ static char g_patch_list[512];
 void patches_apply(const char *list);
 static struct { long frame; char path[256]; } g_shots[32];
 static int g_nshots;
+/* --shot N:FILE for game loops outside main() (RR3) */
+void frame_screenshots(long frame)
+{
+    for (int t = 0; t < g_nshots; t++)
+        if (frame == g_shots[t].frame && !G.headless)
+            LOG("[boot] screenshot %s: %s\n", g_shots[t].path,
+                glhost_screenshot(g_shots[t].path, G.width, G.height) ? "ok" : "failed");
+}
 static cpu_t *g_ui_cpu;
 static struct { long frame; int x, y; } g_taps[32];
 static long g_backs[8], g_cams[8];
@@ -290,6 +299,7 @@ int main(int argc, char **argv)
     G.apk_assets_dir = "./apk_assets";
     G.max_frames = 0;
     G.width = 800; G.height = 480; G.dpi = 240.0f;
+    G.game = 2;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--difftest")) { do_selftest = 3; difft_arg = i + 1; break; }
@@ -376,6 +386,7 @@ int main(int argc, char **argv)
         }
         if (G.headless) LOG("[boot] no host GL: continuing headless\n");
     }
+    if (G.game == 3 || strstr(so_path, "RealRacing3")) return rr3_main(so_path);
     LOG("[boot] loading %s\n", so_path);
     if (elf_load(&G, so_path) != 0)
         fatal("failed to load %s", so_path);

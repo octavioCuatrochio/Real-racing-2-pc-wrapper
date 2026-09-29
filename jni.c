@@ -37,6 +37,9 @@ typedef struct {
     FILE *fp;         /* InputStream */
     gptr  utf;        /* cached GetStringUTFChars copy */
     int   fd;         /* AssetFileDescriptor: host fd + 1 (0 = none) */
+    struct jfv { u32 fid; u64 v; } *fv;   /* instance (or static, for classes) field values */
+    void *native; void (*native_free)(void *);   /* host state of Java classes we implement natively */
+    u16   nfv, capfv;
 } jobj_t;
 
 struct jargs;
@@ -68,6 +71,34 @@ static inline jobj_t *jo(u32 h)
     return (h >= JREF_BASE && i < MAX_JOBJ && objs[i].kind) ? &objs[i] : NULL;
 }
 
+/* local references: objects created while a host->guest native call is running are released
+ * when it returns, like the JVM does; DeleteLocalRef takes them out early */
+typedef struct { u32 *h; int n, cap; int base[64]; int depth; } lframe_t;
+static __thread lframe_t lf;
+static void lf_push_handle(u32 h)
+{
+    if (!lf.depth) return;
+    if (lf.n == lf.cap) { lf.cap = lf.cap ? lf.cap * 2 : 256; lf.h = realloc(lf.h, (size_t)lf.cap * 4); }
+    lf.h[lf.n++] = h;
+}
+static bool lf_take(u32 h)                   /* remove one local entry for h in the current frame */
+{
+    int base = lf.depth ? lf.base[lf.depth - 1] : 0;
+    for (int i = lf.n - 1; i >= base; i--) if (lf.h[i] == h) { lf.h[i] = 0; return true; }
+    return false;
+}
+static void jo_unref(u32 h);
+void jni_push_frame(void) { if (lf.depth < 64) lf.base[lf.depth++] = lf.n; }
+void jni_pop_frame(void)
+{
+    if (!lf.depth) return;
+    int base = lf.base[--lf.depth];
+    for (int i = lf.n - 1; i >= base; i--) if (lf.h[i]) jo_unref(lf.h[i]);
+    lf.n = base;
+}
+/* keep an object we created ourselves (e.g. stored in a field) out of the caller's frame */
+static u32 jo_keep(u32 h) { lf_take(h); return h; }
+
 static u32 jo_new(int kind)
 {
     pthread_mutex_lock(&jlock);
@@ -79,6 +110,7 @@ static u32 jo_new(int kind)
             objs[i].kind = (u8)kind;
             objs[i].refs = 1;
             pthread_mutex_unlock(&jlock);
+            if (kind != K_CLASS) lf_push_handle(JREF_BASE + 4 * i);
             return JREF_BASE + 4 * i;
         }
     }
@@ -98,7 +130,17 @@ static void jo_unref(u32 h)
         if (o->utf) guest_free(o->utf);
         if (o->fd) close(o->fd - 1);
         if (o->kind == K_ARR) guest_free(o->data);
+        if (o->native) { o->native_free(o->native); o->native = NULL; }
+        struct jfv *fv = o->fv; u16 nfv = o->nfv;
+        o->fv = NULL; o->nfv = o->capfv = 0;
         o->kind = K_FREE;
+        pthread_mutex_unlock(&jlock);
+        for (u16 k = 0; k < nfv; k++)                   /* object fields held references */
+            if (fv[k].v >= JREF_BASE && fv[k].v < JREF_BASE + 4 * MAX_JOBJ && (fields[(fv[k].fid - JFID_BASE) >> 2].sig[0] == 'L' ||
+                                                                                  fields[(fv[k].fid - JFID_BASE) >> 2].sig[0] == '['))
+                jo_unref((u32)fv[k].v);
+        free(fv);
+        return;
     }
     pthread_mutex_unlock(&jlock);
 }
@@ -363,7 +405,22 @@ static u64 j_stream_close(cpu_t *c, u32 self, jargs_t *a)
     return 0;
 }
 
-static u64 j_package_name(cpu_t *c, u32 self, jargs_t *a) { return jstr_new("com.ea.game.realracing2_OTD_row"); }
+static char g_ext_files_dir[512] = "/data/data/com.ea.game.realracing2_OTD_row/files";
+static u64 j_package_name(cpu_t *c, u32 self, jargs_t *a)
+{
+    return jstr_new(G.game == 3 ? "com.ea.games.r3_row" : "com.ea.game.realracing2_OTD_row");
+}
+static u64 j_ext_files_dir(cpu_t *c, u32 self, jargs_t *a)
+{
+    u32 h = jnew_obj("java/io/File");
+    jo(h)->str = strdup(g_ext_files_dir);
+    return h;
+}
+void jni_rr3_setup(void)
+{
+    snprintf(g_files_dir, sizeof(g_files_dir), "/data/data/com.ea.games.r3_row/files");
+    snprintf(g_ext_files_dir, sizeof(g_ext_files_dir), "/sdcard/Android/data/com.ea.games.r3_row/files");
+}
 static u64 j_files_dir(cpu_t *c, u32 self, jargs_t *a)
 {
     u32 h = jnew_obj("java/io/File");
@@ -431,6 +488,8 @@ static u64 j_dpi(cpu_t *c, u32 self, jargs_t *a)  { f32 f = G.dpi; u32 b; memcpy
 static u64 j_width(cpu_t *c, u32 self, jargs_t *a)  { return (u32)G.width; }
 static u64 j_height(cpu_t *c, u32 self, jargs_t *a) { return (u32)G.height; }
 
+#include "jni_rr3.inc"
+
 #define SYSD "com/ea/blast/SystemAndroidDelegate"
 #define PKG  "com.ea.game.realracing2_OTD_row"
 
@@ -488,7 +547,7 @@ static const jimpl_ent java_impls[] = {
     { "java/io/InputStream", "close", "()V", j_stream_close },
     { NULL, "getPackageName",  NULL, j_package_name },
     { NULL, "getFilesDir",     NULL, j_files_dir },
-    { NULL, "getExternalFilesDir", NULL, j_files_dir },
+    { NULL, "getExternalFilesDir", NULL, j_ext_files_dir },
     { NULL, "getAbsolutePath", NULL, j_file_path },
     { NULL, "getPath",         NULL, j_file_path },
     { NULL, "mkdirs",          NULL, j_true },
@@ -509,6 +568,14 @@ static u64 j_default(cpu_t *c, u32 self, jargs_t *a);
 
 static const jimpl_ent *bind_impl(const char *cls, const char *name, const char *sig)
 {
+    if (G.game == 3)
+        for (unsigned i = 0; i < sizeof(rr3_impls) / sizeof(rr3_impls[0]); i++) {
+            const jimpl_ent *e = &rr3_impls[i];
+            if (e->cls && strcmp(e->cls, cls)) continue;
+            if (e->name && strcmp(e->name, name)) continue;
+            if (e->sig && strcmp(e->sig, sig)) continue;
+            return e;
+        }
     for (unsigned i = 0; i < sizeof(java_impls) / sizeof(java_impls[0]); i++) {
         const jimpl_ent *e = &java_impls[i];
         if (e->cls && strcmp(e->cls, cls)) continue;
@@ -591,7 +658,15 @@ static void e_NewGlobalRef(cpu_t *c)
     if (o) { pthread_mutex_lock(&jlock); o->refs++; pthread_mutex_unlock(&jlock); }
     hret(c, h);
 }
-static void e_DeleteRef(cpu_t *c)   { jo_unref(harg(c, 1)); }
+static void e_DeleteGlobalRef(cpu_t *c) { jo_unref(harg(c, 1)); }
+static void e_DeleteLocalRef(cpu_t *c)  { u32 h = harg(c, 1); if (lf_take(h) || !lf.depth) jo_unref(h); }
+static void e_NewLocalRef(cpu_t *c)
+{
+    u32 h = harg(c, 1);
+    jobj_t *o = jo(h);
+    if (o && o->kind != K_CLASS) { pthread_mutex_lock(&jlock); o->refs++; pthread_mutex_unlock(&jlock); lf_push_handle(h); }
+    hret(c, h);
+}
 static void e_IsSameObject(cpu_t *c) { hret(c, harg(c, 1) == harg(c, 2)); }
 static void e_EnsureLocalCapacity(cpu_t *c) { hret(c, 0); }
 static void e_AllocObject(cpu_t *c)
@@ -623,6 +698,10 @@ static void jcall(cpu_t *c, int kind, int mode)
     if (mode != M_DOTS) a.p = harg(c, mpos + 1);
     cur_meth = &meths[mi];
     u64 r = meths[mi].fn(c, self, &a);
+    static int trace = -1;
+    if (trace < 0) trace = getenv("RR2_JNI_TRACE") != NULL;
+    if (trace) LOG("[jni] call %s.%s%s -> %llx%s\n", jclass_name(meths[mi].cls), meths[mi].name, meths[mi].sig,
+                   (unsigned long long)r, meths[mi].fn == j_default ? " (default)" : "");
     hret64(c, r);
 }
 
@@ -678,7 +757,15 @@ static u32 field_new(u32 cls, const char *name, const char *sig)
 
 static u64 *fslot(u32 obj, u32 fid, bool create)
 {
-    u32 h = (obj * 2654435761u ^ fid * 40503u) & (FSTORE - 1);
+    jobj_t *o = jo(obj);
+    if (o) {
+        for (u16 k = 0; k < o->nfv; k++) if (o->fv[k].fid == fid) return &o->fv[k].v;
+        if (!create) return NULL;
+        if (o->nfv == o->capfv) { o->capfv = o->capfv ? o->capfv * 2 : 8; o->fv = realloc(o->fv, o->capfv * sizeof(*o->fv)); }
+        o->fv[o->nfv].fid = fid; o->fv[o->nfv].v = 0;
+        return &o->fv[o->nfv++].v;
+    }
+    u32 h = (obj * 2654435761u ^ fid * 40503u) & (FSTORE - 1);   /* not an object handle: global store */
     for (u32 n = 0; n < FSTORE; n++, h = (h + 1) & (FSTORE - 1)) {
         if (fstore[h].obj == obj && fstore[h].fid == fid) return &fstore[h].v;
         if (!fstore[h].obj) {
@@ -689,6 +776,31 @@ static u64 *fslot(u32 obj, u32 fid, bool create)
     }
     fatal("JNI field store full");
 }
+static bool fid_is_obj(u32 fid)
+{
+    u32 i = (fid - JFID_BASE) >> 2;
+    return fid >= JFID_BASE && i < (u32)nfields && (fields[i].sig[0] == 'L' || fields[i].sig[0] == '[');
+}
+/* host-side field access for the Java implementations (objects stored keep a reference) */
+static void jfield_set(u32 obj, const char *cls, const char *name, const char *sig, u64 v)
+{
+    u32 fid = field_new(jclass(cls), name, sig);
+    bool isobj = sig[0] == 'L' || sig[0] == '[';
+    if (isobj && jo((u32)v)) { jobj_t *n = jo((u32)v); pthread_mutex_lock(&jlock); n->refs++; pthread_mutex_unlock(&jlock); }
+    pthread_mutex_lock(&jlock);
+    u64 *slot = fslot(obj, fid, true), old = *slot;
+    *slot = v;
+    pthread_mutex_unlock(&jlock);
+    if (isobj && old) jo_unref((u32)old);
+}
+static u64 jfield_get(u32 obj, const char *cls, const char *name, const char *sig)
+{
+    u32 fid = field_new(jclass(cls), name, sig);
+    pthread_mutex_lock(&jlock);
+    u64 *slot = fslot(obj, fid, false), v = slot ? *slot : 0;
+    pthread_mutex_unlock(&jlock);
+    return v;
+}
 
 static void e_GetFieldID(cpu_t *c) { hret(c, field_new(harg(c, 1), gstr(harg(c, 2)), gstr(harg(c, 3)))); }
 static void e_GetField(cpu_t *c)
@@ -696,14 +808,23 @@ static void e_GetField(cpu_t *c)
     pthread_mutex_lock(&jlock);
     u64 *v = fslot(harg(c, 1), harg(c, 2), false);
     u64 r = v ? *v : 0;
+    jobj_t *o = fid_is_obj(harg(c, 2)) ? jo((u32)r) : NULL;
+    if (o && o->kind != K_CLASS) o->refs++;             /* GetObjectField returns a new local reference */
     pthread_mutex_unlock(&jlock);
+    if (o && o->kind != K_CLASS) lf_push_handle((u32)r);
     hret64(c, r);
 }
 static void e_SetField32(cpu_t *c)
 {
+    u32 v = harg(c, 3), old;
+    bool isobj = fid_is_obj(harg(c, 2));
     pthread_mutex_lock(&jlock);
-    *fslot(harg(c, 1), harg(c, 2), true) = harg(c, 3);
+    if (isobj && jo(v)) jo(v)->refs++;
+    u64 *slot = fslot(harg(c, 1), harg(c, 2), true);
+    old = (u32)*slot;
+    *slot = v;
     pthread_mutex_unlock(&jlock);
+    if (isobj && old) jo_unref(old);
 }
 static void e_SetField64(cpu_t *c)
 {
@@ -898,8 +1019,8 @@ void jni_init(void)
         [11] = e_IsAssignableFrom, [13] = e_Throw, [14] = e_ThrowNew,
         [15] = e_ExceptionOccurred, [16] = e_ExceptionDescribe, [17] = e_ExceptionClear,
         [18] = e_FatalError, [19] = e_PushLocalFrame, [20] = e_PopLocalFrame,
-        [21] = e_NewGlobalRef, [22] = e_DeleteRef, [23] = e_DeleteRef,
-        [24] = e_IsSameObject, [25] = e_NewGlobalRef, [26] = e_EnsureLocalCapacity,
+        [21] = e_NewGlobalRef, [22] = e_DeleteGlobalRef, [23] = e_DeleteLocalRef,
+        [24] = e_IsSameObject, [25] = e_NewLocalRef, [26] = e_EnsureLocalCapacity,
         [27] = e_AllocObject, [28] = e_NewObject, [29] = e_NewObjectV, [30] = e_NewObjectA,
         [31] = e_GetObjectClass, [32] = e_IsInstanceOf, [33] = e_GetMethodID,
         [94] = e_GetFieldID, [113] = e_GetMethodID, [144] = e_GetFieldID,
@@ -916,7 +1037,7 @@ void jni_init(void)
         [220] = e_GetStringRegion, [221] = e_GetStringUTFRegion,
         [222] = e_GetArrayElements, [223] = e_ReleaseArrayElements,
         [224] = e_GetStringChars, [225] = e_ReleaseStringChars,
-        [226] = e_NewGlobalRef, [227] = e_DeleteRef, [228] = e_ExceptionCheck,
+        [226] = e_NewGlobalRef, [227] = e_DeleteGlobalRef, [228] = e_ExceptionCheck,
         [229] = e_NewDirectByteBuffer, [230] = e_GetDirectBufferAddress,
         [231] = e_GetDirectBufferCapacity, [232] = e_GetObjectRefType,
     };
@@ -974,7 +1095,7 @@ void jni_init(void)
     st32(g_vm, vtab);
 
     snprintf(g_apk_assets, sizeof(g_apk_assets), "%s", G.apk_assets_dir);
-    h_activity = jnew_obj("com/ea/game/realracing2_OTD_row/RealRacing2Activity");
+    h_activity = jnew_obj(G.game == 3 ? "com/firemint/realracing/MainActivity" : "com/ea/game/realracing2_OTD_row/RealRacing2Activity");
     h_assets = jnew_obj("android/content/res/AssetManager");
 }
 
@@ -984,3 +1105,5 @@ u32 jni_activity(void) { return h_activity; }
 u32 jni_object(const char *cls) { return jnew_obj(cls); }
 u32 jni_class(const char *name) { return jclass(name); }
 u32 jni_string(const char *s) { return jstr_new(s); }
+
+#include "jni_rr3_text.inc"

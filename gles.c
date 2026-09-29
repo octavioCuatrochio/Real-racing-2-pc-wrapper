@@ -49,6 +49,15 @@ static gptr gl_string(const char *s)
 
 static void hle_glGetString(cpu_t *c)
 {
+    if (G.game == 3) {                          /* RR3 picks its texture set (ATC) from an Adreno renderer */
+        switch (harg(c, 0)) {
+        case 0x1F00: hret(c, gl_string("Qualcomm")); return;
+        case 0x1F01: hret(c, gl_string("Adreno (TM) 540")); return;
+        case 0x1F03: hret(c, gl_string("GL_AMD_compressed_ATC_texture GL_OES_vertex_array_object GL_OES_depth24 "
+                                       "GL_OES_packed_depth_stencil GL_OES_rgb8_rgba8 GL_OES_texture_npot "
+                                       "GL_EXT_texture_filter_anisotropic GL_OES_element_index_uint")); return;
+        }
+    }
     switch (harg(c, 0)) {
     case 0x1F00: hret(c, gl_string("rr2emu")); break;                    /* VENDOR */
     case 0x1F01: hret(c, gl_string("headless-gpu")); break;              /* RENDERER */
