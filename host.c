@@ -285,7 +285,7 @@ int host_menu_poll(int wait_ms, menu_event_t *ev)
         return MENU_NONE; }
     case SDL_CONTROLLERDEVICEADDED: {
         s32 idx; memcpy(&idx, e.pad + 8, 4);
-        if (sdl.IsGameController(idx)) sdl.GameControllerOpen(idx);
+        if (sdl.IsGameController(idx) && sdl.GameControllerOpen(idx)) LOG("[host] game controller %d connected\n", idx);
         return MENU_NONE; }
     }
     return MENU_NONE;
@@ -406,7 +406,7 @@ bool host_present(void)
             break; }
         case SDL_CONTROLLERDEVICEADDED: {
             s32 idx; memcpy(&idx, e.pad + 8, 4);
-            if (sdl.IsGameController(idx)) sdl.GameControllerOpen(idx);
+            if (sdl.IsGameController(idx) && sdl.GameControllerOpen(idx)) LOG("[host] game controller %d connected\n", idx);
             break; }
         case SDL_MOUSEBUTTONDOWN:
         case SDL_MOUSEBUTTONUP:
