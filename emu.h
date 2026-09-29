@@ -217,6 +217,9 @@ typedef struct emu {
     const char *apk_assets_dir;
     int   game;                     /* 2 = Real Racing 2, 3 = Real Racing 3 */
     const char *save_dir;           /* write overlay ("./save" for RR2) */
+    const char *rr3_apk_dir;        /* RR3 overrides of the assets_dir layout (NULL: assets_dir/apk, /sdcard) */
+    const char *rr3_base_apk;
+    const char *rr3_sdcard_dir;
     int   max_frames;
     int   width, height;
     int   headless, vsync, fullscreen, aniso;
@@ -322,6 +325,8 @@ void  host_text_input(int on);
 float glhost_max_aniso(void);
 bool  launcher_run(const char **so_path);
 int   rr3_main(const char *so_path);
+#define LAUNCHER_W 800
+#define LAUNCHER_H 640
 extern int g_do_prof;
 void  prof_start(void);
 void  prof_report(void);

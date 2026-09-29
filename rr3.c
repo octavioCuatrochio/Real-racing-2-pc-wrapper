@@ -164,7 +164,7 @@ int rr3_main(const char *so_path)
     /* timed scripting: RR2_T_PROF / RR2_T_STOP seconds, RR2_T_SHOT png at stop, RR2_TAPS "sec:x,y;..." */
     double t_prof = getenv("RR2_T_PROF") ? atof(getenv("RR2_T_PROF")) : g_do_prof ? 0 : -1;
     double t_stop = getenv("RR2_T_STOP") ? atof(getenv("RR2_T_STOP")) : 0;
-    const char *taps = getenv("RR2_TAPS");
+    const char *taps = getenv("RR2_TAPS"), *shots = getenv("RR2_SHOTS");
     struct timespec tb;
     clock_gettime(CLOCK_MONOTONIC, &tb);
     for (; render && (!G.max_frames || frames < G.max_frames); frames++) {
@@ -173,16 +173,27 @@ int rr3_main(const char *so_path)
         double now = (t1.tv_sec - tb.tv_sec) + (t1.tv_nsec - tb.tv_nsec) / 1e9;
         if (g_do_prof && t_prof >= 0 && now >= t_prof) { prof_start(); prof_frame = frames; t_prof = -1; }
         bool stop = t_stop && now >= t_stop;
-        while (taps && *taps) {
-            double at; int x, y, nch = 0;
-            if (sscanf(taps, "%lf:%d,%d%n", &at, &x, &y, &nch) != 3) { taps = NULL; break; }
+        static int tap_x, tap_y; static double tap_up;
+        if (tap_up && now >= tap_up) { on_touch3(1, tap_x, tap_y); tap_up = 0; }
+        while (!tap_up && taps && *taps) {
+            double at; int nch = 0;
+            if (sscanf(taps, "%lf:%d,%d%n", &at, &tap_x, &tap_y, &nch) != 3) { taps = NULL; break; }
             if (now < at) break;
-            LOG("[rr3] tap %d,%d at %.1fs\n", x, y, now);
-            on_touch3(0, x, y); on_touch3(1, x, y);
+            LOG("[rr3] tap %d,%d at %.1fs\n", tap_x, tap_y, now);
+            on_touch3(0, tap_x, tap_y);
+            tap_up = now + 0.15;
             taps += nch; if (*taps == ';') taps++;
         }
         rr3_input(c);
         jcall(c, render, 2, ra);
+        while (shots && *shots) {                            /* RR2_SHOTS "sec:file.png;..." */
+            double at; char path[256]; int nch = 0;
+            if (sscanf(shots, "%lf:%255[^;]%n", &at, path, &nch) != 2) { shots = NULL; break; }
+            if (now < at) break;
+            LOG("[rr3] screenshot %s at %.1fs\n", path, now);
+            glhost_screenshot(path, G.width, G.height);
+            shots += nch; if (*shots == ';') shots++;
+        }
         if (stop) {
             if (getenv("RR2_T_SHOT")) glhost_screenshot(getenv("RR2_T_SHOT"), G.width, G.height);
             break;

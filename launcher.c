@@ -16,8 +16,9 @@
 #include <time.h>
 
 #define W 800
-#define H 640
+#define H LAUNCHER_H
 #define SO_REL "lib/armeabi/libEAMRealRacing2.so"
+#define SO3_REL "lib/armeabi-v7a/libRealRacing3.so"
 
 static const u8 font5x8[95][8] = {
     { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
@@ -453,11 +454,13 @@ static void gl_teardown(void)
 
 /* ---- settings ---- */
 
-enum { R_APK, R_DATA, R_RES, R_FULL, R_ANISO, R_VSYNC, R_ASSIST, R_TILT, R_FOV, R_PLAY, R_CTRL, R_QUIT, NROWS };
+enum { R_GAME, R_APK, R_DATA, R_RES, R_FULL, R_ANISO, R_VSYNC, R_ASSIST, R_TILT, R_FOV, R_PLAY, R_CTRL, R_QUIT, NROWS };
 #define R_LAST_OPT R_FOV
-static const char *const labels[] = { "Game APK", "Game data (OBB)", "Resolution", "Fullscreen", "Anisotropic", "VSync",
+static const char *const labels[] = { "Game", "Game APK", "Game data (OBB)", "Resolution", "Fullscreen", "Anisotropic", "VSync",
                                       "Disable assists", "Horizon tilt", "Cockpit FOV" };
-static char apk[1024], data[1024], edit[1024], status[256];
+/* apk/data: paths for the selected game; other_*: the other game's, swapped in on a switch */
+static char apk[1024], data[1024], other_apk[1024], other_data[1024], edit[1024], status[256];
+static int game = 2;
 static u32 status_rgb;
 static struct { int w, h; } res[16];
 static int nres, ires, native_w = 1920, native_h = 1080;
@@ -483,6 +486,11 @@ static void home_path(char *out, size_t n, const char *xdg, const char *fallback
 #endif
 }
 
+#define rr2_apk (game == 2 ? apk : other_apk)
+#define rr2_data (game == 2 ? data : other_data)
+#define rr3_apk (game == 3 ? apk : other_apk)
+#define rr3_data (game == 3 ? data : other_data)
+
 static void cfg_load(void)
 {
     char path[1024], line[1200];
@@ -495,8 +503,11 @@ static void cfg_load(void)
         if (!v) continue;
         *v++ = 0;
         int a;
-        if (!strcmp(line, "apk")) snprintf(apk, sizeof(apk), "%s", v);
-        else if (!strcmp(line, "data")) snprintf(data, sizeof(data), "%s", v);
+        if (!strcmp(line, "apk")) snprintf(rr2_apk, sizeof(apk), "%s", v);
+        else if (!strcmp(line, "data")) snprintf(rr2_data, sizeof(apk), "%s", v);
+        else if (!strcmp(line, "rr3_apk")) snprintf(rr3_apk, sizeof(apk), "%s", v);
+        else if (!strcmp(line, "rr3_data")) snprintf(rr3_data, sizeof(apk), "%s", v);
+        else if (!strcmp(line, "game")) game = atoi(v) == 3 ? 3 : 2;
         else if (!strcmp(line, "width")) G.width = atoi(v);
         else if (!strcmp(line, "height")) G.height = atoi(v);
         else if (!strcmp(line, "fullscreen")) G.fullscreen = atoi(v);
@@ -532,9 +543,9 @@ static void cfg_save(void)
     strcat(path, "rr2emu.cfg");
     FILE *f = fopen(path, "w");
     if (!f) return;
-    fprintf(f, "apk=%s\ndata=%s\nwidth=%d\nheight=%d\nfullscreen=%d\naniso=%d\nvsync=%d\n"
+    fprintf(f, "game=%d\napk=%s\ndata=%s\nrr3_apk=%s\nrr3_data=%s\nwidth=%d\nheight=%d\nfullscreen=%d\naniso=%d\nvsync=%d\n"
                "no_assists=%d\nno_tilt=%d\ncockpit_fov=%d\n",
-            apk, data, G.width, G.height, G.fullscreen, G.aniso, G.vsync, G.no_assists, G.no_tilt, G.cockpit_fov);
+            game, rr2_apk, rr2_data, rr3_apk, rr3_data, G.width, G.height, G.fullscreen, G.aniso, G.vsync, G.no_assists, G.no_tilt, G.cockpit_fov);
     for (int a = 0; a < ACT_COUNT; a++)
         fprintf(f, "bind%d=%d,%d,%d,%d\n", a, g_binds[a][0], g_binds[a][1], g_binds[a][2], g_binds[a][3]);
     fclose(f);
@@ -589,8 +600,8 @@ static void set_status(u32 rgb, const char *fmt, const char *arg)
 #define PW (W - 2 * PX)
 #define VX (PX + 250)
 #define VR (PX + PW - 16)
-static const int row_top[] = { 112, 146, 218, 252, 286, 320, 392, 426, 460 };
-#define BTN_Y 510
+static const int row_top[] = { 112, 146, 180, 244, 278, 312, 346, 410, 444, 478 };
+#define BTN_Y 524
 #define BTN_W 200
 #define BTN_H 40
 static const int btn_x[3] = { W / 2 - 316, W / 2 - 100, W / 2 + 116 };
@@ -662,7 +673,9 @@ static void panel_row(int x, int y, int w, int last)
 static void draw_value_row(int i, int y, int on)
 {
     char v[64];
-    if (i == R_RES) snprintf(v, sizeof(v), "%d x %d%s", res[ires].w, res[ires].h,
+    if (i == R_GAME) snprintf(v, sizeof(v), "Real Racing %d", game);
+    else if (game == 3 && i >= R_ASSIST) snprintf(v, sizeof(v), "Real Racing 2 only");
+    else if (i == R_RES) snprintf(v, sizeof(v), "%d x %d%s", res[ires].w, res[ires].h,
                              res[ires].w == native_w && res[ires].h == native_h ? "  (native)" : "");
     else if (i == R_FULL) snprintf(v, sizeof(v), "%s", G.fullscreen ? "On" : "Off");
     else if (i == R_VSYNC) snprintf(v, sizeof(v), "%s", G.vsync ? "On" : "Off");
@@ -674,10 +687,13 @@ static void draw_value_row(int i, int y, int on)
     else snprintf(v, sizeof(v), "Off");
     int f = on ? F_BOLD : F_BODY, tw = text_w(f, v), ty = y + (ROW_H - fonts[f].height) / 2;
     GLfloat cy = ty + fonts[f].asc * 0.62f;
-    u32 ac = on ? 0xffffffffu : 0x2f7fe0ffu, fg = on ? 0xffffffffu : C_BLUE;
-    arrow(VX, cy, -1, ac);
-    arrow(VR - 8, cy, 1, ac);
-    if (i == R_FOV) {                                    /* slider track */
+    bool off = game == 3 && i >= R_ASSIST;
+    u32 ac = on ? 0xffffffffu : 0x2f7fe0ffu, fg = on ? 0xffffffffu : off ? 0x9aa8b8ffu : C_BLUE;
+    if (!off) {
+        arrow(VX, cy, -1, ac);
+        arrow(VR - 8, cy, 1, ac);
+    }
+    if (i == R_FOV && game == 2) {                       /* slider track */
         int tx = VX + 24, tw2 = 180;
         float t = (float)(G.cockpit_fov - FOV_MIN) / (FOV_MAX - FOV_MIN);
         rrect(tx, cy - 3, tw2, 6, 3, on ? 0xffffff50u : 0xc5d0dcffu, on ? 0xffffff30u : 0xdde4ecffu);
@@ -693,16 +709,17 @@ static void draw_value_row(int i, int y, int on)
 static void draw_main(void)
 {
     section(88, "GAME FILES");
-    section(194, "DISPLAY");
-    section(368, "GAMEPLAY");
-    static const int groups[][2] = { { R_APK, R_DATA }, { R_RES, R_VSYNC }, { R_ASSIST, R_FOV } };
+    section(220, "DISPLAY");
+    section(386, "GAMEPLAY");
+    static const int groups[][2] = { { R_GAME, R_DATA }, { R_RES, R_VSYNC }, { R_ASSIST, R_FOV } };
     for (int g = 0; g < 3; g++)
         frame(PX - 1, row_top[groups[g][0]] - 1, PW + 2, (groups[g][1] - groups[g][0] + 1) * ROW_H + 2, 0x9eb0c5ffu);
     for (int i = 0; i <= R_LAST_OPT; i++) {
         int y = row_top[i], on = sel == i;
         panel_row(PX, y, PW, i == R_DATA || i == R_VSYNC || i == R_FOV);
         if (on) sel_bar(PX + 3, y + 3, PW - 6, ROW_H - 6);
-        text(on ? F_BOLD : F_BODY, PX + 16, y + (ROW_H - fonts[F_BODY].height) / 2, on ? 0xffffffffu : C_NAVY, labels[i], 0);
+        const char *label = game == 3 && i == R_DATA ? "Game data" : labels[i];
+        text(on ? F_BOLD : F_BODY, PX + 16, y + (ROW_H - fonts[F_BODY].height) / 2, on ? 0xffffffffu : C_NAVY, label, 0);
         if (i != R_APK && i != R_DATA) { draw_value_row(i, y, on); continue; }
         const char *p = editing && on ? edit : i == R_APK ? apk : data;
         char buf[1100];
@@ -714,7 +731,10 @@ static void draw_main(void)
             fit_left(buf, sizeof(buf), F_SMALL, tmp, VR - VX - 4);
             text(F_SMALL, VX, ty, C_NAVY, buf, 0);
         } else if (!*p) {
-            text(F_SMALL, VX, ty, on ? 0xdbe9ffffu : 0x7d8ea3ffu, "Drop a file here, or press Enter to type a path", 0);
+            text(F_SMALL, VX, ty, on ? 0xdbe9ffffu : 0x7d8ea3ffu,
+                 game == 3 ? (i == R_APK ? "APK file or install folder; Enter to type a path"
+                                         : "com.ea.games.r3_row data folder (or zip)")
+                           : "Drop a file here, or press Enter to type a path", 0);
         } else {
             fit_left(buf, sizeof(buf), F_SMALL, p, VR - VX);
             text(F_SMALL, VX, ty, on ? 0xffffffffu : C_BLUE, buf, 0);
@@ -769,12 +789,12 @@ static void draw(void)
     grad(0, 0, W, 34, 0xffffff22u, 0xffffff08u, 0);
     grad(0, 74, W, 2, 0x6cc0ffffu, 0x2f7fe0ffu, 0);
     for (int i = 0; i < 3; i++) grad(W - 250 + i * 16, 18, 8, 38, 0xffffff30u, 0xffffff10u, -10);
-    text(F_LOGO, 30, 14, 0xffffffffu, "REAL RACING 2", logo_slant);
+    text(F_LOGO, 30, 14, 0xffffffffu, game == 3 ? "REAL RACING 3" : "REAL RACING 2", logo_slant);
     const char *tag = page ? "rr2emu  CONTROLS" : "rr2emu  SETUP";
     text(F_HEAD, W - 30 - text_w(F_HEAD, tag), 28, 0xbcd6f5ffu, tag, logo_slant);
 
     if (page) draw_controls(); else draw_main();
-    if (*status) text(F_BODY, (W - text_w(F_BODY, status)) / 2, 562, status_rgb, status, 0);
+    if (*status) text(F_BODY, (W - text_w(F_BODY, status)) / 2, BTN_Y + BTN_H + 5, status_rgb, status, 0);
 
     grad(0, FOOT_Y, W, H - FOOT_Y, 0x1d2a3cffu, 0x0b121cffu, 0);
     grad(0, FOOT_Y, W, 1, 0x4d6c93ffu, 0x4d6c93ffu, 0);
@@ -795,7 +815,7 @@ static void draw(void)
         x = pill(x, "Enter", "Select");
         x = pill(x, "Arrows", "Change");
         x = pill(x, "Esc", "Exit");
-        pill(x, "Drag & drop", "APK / OBB");
+        pill(x, "Drag & drop", game == 3 ? "APK / data" : "APK / OBB");
     }
     flush();
 }
@@ -819,6 +839,7 @@ static bool pump_quit(void)
 static bool entry_wanted(const char *name, int apk_mode)
 {
     if (!*name || name[0] == '/' || strstr(name, "..")) return false;
+    if (apk_mode == 3) return !strncmp(name, "lib/armeabi-v7a/", 16);
     return !apk_mode || !strcmp(name, SO_REL) || !strncmp(name, "assets/", 7);
 }
 
@@ -926,9 +947,56 @@ static bool has_game_dir(const char *dir)
 }
 
 static char so_buf[1400], apk_assets_buf[1200], data_buf[1200];
+static char rr3_apk_buf[1200], rr3_base_buf[1200], rr3_sd_buf[1200];
+
+static bool path_has(const char *dir, const char *rel)
+{
+    char p[1400];
+    snprintf(p, sizeof(p), "%s/%s", dir, rel);
+    return is_file(p) || is_dir(p);
+}
+
+/* RR3: APK file (libs unpacked, base.apk read in place) or an install folder;
+ * data: the com.ea.games.r3_row external data (files/.depot), an extracted root holding sdcard/, or a zip of either */
+static bool prepare3(void)
+{
+    char root[1100];
+    const char *libs;
+    rr3_base_buf[0] = 0;
+    if (is_file(apk)) {
+        if (!unpack_cached(apk, "apk3", 3, root, sizeof(root))) return false;
+        libs = "lib/armeabi-v7a";
+        snprintf(rr3_base_buf, sizeof(rr3_base_buf), "%s", apk);
+    } else if (is_dir(apk)) {
+        snprintf(root, sizeof(root), "%s", apk);
+        if (!path_has(root, "lib") && path_has(root, "apk/lib")) strcat(root, "/apk");
+        libs = path_has(root, "lib/arm/libRealRacing3.so") ? "lib/arm" : "lib/armeabi-v7a";
+        if (path_has(root, "base.apk")) snprintf(rr3_base_buf, sizeof(rr3_base_buf), "%s/base.apk", root);
+    } else { set_status(0xc62828ffu, "%s", *apk ? "APK not found" : "Choose the Real Racing 3 APK"); sel = R_APK; return false; }
+    snprintf(so_buf, sizeof(so_buf), "%s/%s/libRealRacing3.so", root, libs);
+    if (!is_file(so_buf)) { set_status(0xc62828ffu, "%s", "The APK has no " SO3_REL); sel = R_APK; return false; }
+    snprintf(rr3_apk_buf, sizeof(rr3_apk_buf), "%s", root);
+
+    const char *src = *data ? data : apk;                       /* an extracted install holds both */
+    if (is_file(src) && src == data) { if (!unpack_cached(data, "data3", 0, root, sizeof(root))) return false; }
+    else if (is_dir(src)) snprintf(root, sizeof(root), "%s", src);
+    else { set_status(0xc62828ffu, "%s", *data ? "Game data not found" : "Choose the game data folder"); sel = R_DATA; return false; }
+    if (path_has(root, "com.ea.games.r3_row")) strcat(root, "/com.ea.games.r3_row");
+    size_t rl = strlen(root);
+    if (src == apk && rl > 4 && !strcmp(root + rl - 4, "/apk")) root[rl - 4] = 0;
+    if (path_has(root, "sdcard/files/.depot")) {
+        snprintf(data_buf, sizeof(data_buf), "%s", root);
+        snprintf(rr3_sd_buf, sizeof(rr3_sd_buf), "%s/sdcard", root);
+    } else if (path_has(root, "files/.depot")) {
+        snprintf(rr3_sd_buf, sizeof(rr3_sd_buf), "%s", root);
+        snprintf(data_buf, sizeof(data_buf), "%s", root);
+    } else { set_status(0xc62828ffu, "%s", "No files/.depot in the game data folder"); sel = R_DATA; return false; }
+    return true;
+}
 
 static bool prepare(void)
 {
+    if (game == 3) return prepare3();
     char root[1100], p[1300];
     if (is_dir(apk)) snprintf(root, sizeof(root), "%s", apk);
     else if (is_file(apk)) { if (!unpack_cached(apk, "apk", 1, root, sizeof(root))) return false; }
@@ -989,9 +1057,20 @@ static int hit_controls(int x, int y)
     return -1;
 }
 
+static void change_game(void)
+{
+    char t[1024];
+    memcpy(t, apk, sizeof(t)); memcpy(apk, other_apk, sizeof(t)); memcpy(other_apk, t, sizeof(t));
+    memcpy(t, data, sizeof(t)); memcpy(data, other_data, sizeof(t)); memcpy(other_data, t, sizeof(t));
+    game = game == 2 ? 3 : 2;
+    *status = 0;
+}
+
 static void change(int d)
 {
+    if (game == 3 && sel >= R_ASSIST && sel <= R_FOV) return;
     switch (sel) {
+    case R_GAME: change_game(); break;
     case R_RES: ires = (ires + d + nres) % nres; break;
     case R_FULL: G.fullscreen ^= 1; break;
     case R_ANISO: ianiso = (ianiso + d + naniso) % naniso; break;
@@ -1075,6 +1154,11 @@ static int handle(int e, menu_event_t *ev)
     if (e == MENU_DROP) {
         size_t l = strlen(ev->text);
         int is_apk = l > 4 && !strcasecmp(ev->text + l - 4, ".apk");
+        if (game == 3 && !is_apk) {
+            char t[1024];
+            clean_path(t, sizeof(t), ev->text);
+            is_apk = is_dir(t) && (path_has(t, "lib") || path_has(t, "apk/lib"));
+        }
         if (editing) edit_end(0);
         clean_path(is_apk ? apk : data, sizeof(apk), ev->text);
         cfg_save();
@@ -1100,7 +1184,7 @@ static int handle(int e, menu_event_t *ev)
     }
     switch (e) {
     case MENU_UP: sel = sel > R_PLAY ? R_LAST_OPT : (sel + NROWS - 1) % NROWS; if (sel > R_QUIT) sel = R_QUIT; break;
-    case MENU_DOWN: sel = sel >= R_PLAY ? R_APK : sel + 1; break;
+    case MENU_DOWN: sel = sel >= R_PLAY ? R_GAME : sel + 1; break;
     case MENU_LEFT: change(-1); break;
     case MENU_RIGHT: change(1); break;
     case MENU_BACK: return -1;
@@ -1136,14 +1220,17 @@ static int handle(int e, menu_event_t *ev)
 bool launcher_run(const char **so_path)
 {
     if (!gl_setup()) { LOG("[launcher] host GL lacks basics\n"); return *so_path != NULL; }
-    if (*so_path) {
+    cfg_load();
+    if (*so_path) {                                  /* a path on the command line wins over the saved one */
         char tmp[1100];
         snprintf(tmp, sizeof(tmp), "%s", *so_path);
+        char *lib = strstr(tmp, "/lib/");
+        if (strstr(tmp, "RealRacing3") && game == 2) change_game();
+        if (game == 3 && lib) { *lib = 0; clean_path(apk, sizeof(apk), tmp); }
         size_t l = strlen(tmp), r = strlen(SO_REL);
-        if (l > r && !strcmp(tmp + l - r, SO_REL)) { tmp[l - r] = 0; clean_path(apk, sizeof(apk), tmp); }
+        if (game == 2 && l > r && !strcmp(tmp + l - r, SO_REL)) { tmp[l - r] = 0; clean_path(apk, sizeof(apk), tmp); }
         if (strcmp(G.assets_dir, "./assets")) clean_path(data, sizeof(data), G.assets_dir);
     }
-    cfg_load();
     build_lists();
     const char *shot = getenv("RR2_LAUNCHER_SHOT");
     for (;;) {
@@ -1166,7 +1253,12 @@ bool launcher_run(const char **so_path)
     }
     cfg_save();
     *so_path = so_buf;
-    G.apk_assets_dir = apk_assets_buf;
+    G.game = game;
+    if (game == 3) {
+        G.rr3_apk_dir = rr3_apk_buf;
+        G.rr3_base_apk = *rr3_base_buf ? rr3_base_buf : NULL;
+        G.rr3_sdcard_dir = rr3_sd_buf;
+    } else G.apk_assets_dir = apk_assets_buf;
     G.assets_dir = data_buf;
     LOG("[launcher] %s | %s | %dx%d%s aniso %d vsync %d assists %s tilt %s fov %+d\n", so_buf, data_buf, G.width, G.height,
         G.fullscreen ? " fullscreen" : "", G.aniso, G.vsync, G.no_assists ? "off" : "game", G.no_tilt ? "off" : "game",

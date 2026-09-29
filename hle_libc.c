@@ -42,6 +42,20 @@ static int guest_errno_get(cpu_t *c)
 static char g_cwd[512] = "/";
 static pthread_mutex_t vfs_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* read-only location of a translated tail (RR3 may keep apk/ and sdcard/ elsewhere) */
+static void vfs_data_path(char *out, size_t n, const char *tail)
+{
+    if (G.game == 3) {
+        if (G.rr3_base_apk && !strcmp(tail, "apk/base.apk")) { snprintf(out, n, "%s", G.rr3_base_apk); return; }
+        if (G.rr3_apk_dir && !strncmp(tail, "apk/", 4)) { snprintf(out, n, "%s/%s", G.rr3_apk_dir, tail + 4); return; }
+        if (G.rr3_sdcard_dir && !strncmp(tail, "sdcard", 6) && (!tail[6] || tail[6] == '/')) {
+            snprintf(out, n, "%s%s", G.rr3_sdcard_dir, tail + 6);
+            return;
+        }
+    }
+    snprintf(out, n, "%s/%s", G.assets_dir, tail);
+}
+
 /* translate; returns static buffer (call under vfs_lock or copy out).
  * Writes land in ./save; reads prefer ./save (so saves read back) then the data root. */
 static const char *vfs_xlate_locked(const char *gpath, int for_write)
@@ -84,7 +98,7 @@ static const char *vfs_xlate_locked(const char *gpath, int for_write)
     }
     snprintf(out, sizeof(out), "%s/%s", save, tail);
     if (!for_write && access(out, F_OK) != 0)
-        snprintf(out, sizeof(out), "%s/%s", G.assets_dir, tail);
+        vfs_data_path(out, sizeof(out), tail);
     return out;
 }
 
@@ -97,7 +111,7 @@ const char *vfs_base_path(const char *gpath, char *buf, size_t n)
     const char *save = G.save_dir ? G.save_dir : "./save";
     size_t sl = strlen(save);
     int ok = !strncmp(o, save, sl) && o[sl] == '/';
-    if (ok) snprintf(buf, n, "%s/%s", G.assets_dir, o + sl + 1);
+    if (ok) vfs_data_path(buf, n, o + sl + 1);
     pthread_mutex_unlock(&vfs_lock);
     return ok ? buf : NULL;
 }

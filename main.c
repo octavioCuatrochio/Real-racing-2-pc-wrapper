@@ -378,7 +378,7 @@ int main(int argc, char **argv)
         usage(argv[0]);
 
     if (!G.headless) {
-        if (!host_video_init(ui ? 800 : G.width, ui ? 640 : G.height, ui || G.vsync)) {
+        if (!host_video_init(ui ? LAUNCHER_W : G.width, ui ? LAUNCHER_H : G.height, ui || G.vsync)) {
             if (!so_path) fatal("the launcher needs SDL2 with GLES2");
             G.headless = 1;
         } else {
