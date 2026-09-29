@@ -40,9 +40,19 @@ static u32 f_touch_begin, f_touch_move, f_touch_end, f_key_down, f_key_up, f_pad
 
 static inline u32 fbits(float f) { u32 b; memcpy(&b, &f, 4); return b; }
 
+/* input log with seconds since the render loop started, for turning a manual run into RR2_TAPS */
+static struct timespec g_t0;
+static double since_start(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (t.tv_sec - g_t0.tv_sec) + (t.tv_nsec - g_t0.tv_nsec) / 1e9;
+}
+
 static void on_touch3(int action, int x, int y)
 {
     if (!g_ui) return;
+    if (action != 2) LOG("[input] %.2fs touch %s %d,%d\n", since_start(), action == 0 ? "down" : "up", x, y);
     u32 a[4] = { 0, fbits((float)x), fbits((float)y), 1 };
     if (action == 0) jcall(g_ui, f_touch_begin, 3, a);
     else if (action == 2) jcall(g_ui, f_touch_move, 3, a);
@@ -68,6 +78,7 @@ static void pad_axis(cpu_t *c, int axis, float v)
 }
 static void pad_button(cpu_t *c, int btn, int down)
 {
+    LOG("[input] %.2fs pad button %d %s\n", since_start(), btn, down ? "down" : "up");
     u32 a[3] = { 1, (u32)down, (u32)btn };
     pad_call(c, f_pad_btn, 3, a);
 }
@@ -91,6 +102,7 @@ static void rr3_input(cpu_t *c)
     prev_btn = b;
     while (cams < g_input.camera) { pad_button(c, 3, 1); pad_button(c, 3, 0); cams++; }   /* camera: Y */
     while (backs < g_input.back) {                          /* Android KEYCODE_BACK */
+        LOG("[input] %.2fs back\n", since_start());
         u32 k = 4;
         jcall(c, f_key_down, 1, &k);
         jcall(c, f_key_up, 1, &k);
@@ -164,9 +176,10 @@ int rr3_main(const char *so_path)
     /* timed scripting: RR2_T_PROF / RR2_T_STOP seconds, RR2_T_SHOT png at stop, RR2_TAPS "sec:x,y;..." */
     double t_prof = getenv("RR2_T_PROF") ? atof(getenv("RR2_T_PROF")) : g_do_prof ? 0 : -1;
     double t_stop = getenv("RR2_T_STOP") ? atof(getenv("RR2_T_STOP")) : 0;
-    const char *taps = getenv("RR2_TAPS"), *shots = getenv("RR2_SHOTS");
+    const char *taps = getenv("RR2_TAPS"), *shots = getenv("RR2_SHOTS"), *pads = getenv("RR2_PADS");
     struct timespec tb;
     clock_gettime(CLOCK_MONOTONIC, &tb);
+    g_t0 = tb;
     for (; render && (!G.max_frames || frames < G.max_frames); frames++) {
         g_frame = frames;
         clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -183,6 +196,16 @@ int rr3_main(const char *so_path)
             on_touch3(0, tap_x, tap_y);
             tap_up = now + 0.15;
             taps += nch; if (*taps == ';') taps++;
+        }
+        static int pad_b = -1; static double pad_up;           /* RR2_PADS "sec:rr3button;..." */
+        if (pad_b >= 0 && now >= pad_up) { pad_button(c, pad_b, 0); pad_b = -1; }
+        while (pad_b < 0 && pads && *pads) {
+            double at; int nch = 0;
+            if (sscanf(pads, "%lf:%d%n", &at, &pad_b, &nch) != 2) { pads = NULL; pad_b = -1; break; }
+            if (now < at) { pad_b = -1; break; }
+            pad_button(c, pad_b, 1);
+            pad_up = now + 0.15;
+            pads += nch; if (*pads == ';') pads++;
         }
         rr3_input(c);
         jcall(c, render, 2, ra);
