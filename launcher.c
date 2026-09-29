@@ -14,6 +14,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <time.h>
+#include "download.h"
+#ifndef _WIN32
+#include <sys/statvfs.h>
+#endif
 
 #define W 800
 #define H LAUNCHER_H
@@ -454,13 +458,16 @@ static void gl_teardown(void)
 
 /* ---- settings ---- */
 
-enum { R_GAME, R_APK, R_DATA, R_RES, R_FULL, R_ANISO, R_VSYNC, R_ASSIST, R_TILT, R_FOV, R_PLAY, R_CTRL, R_QUIT, NROWS };
+enum { R_GAME, R_APK, R_DATA, R_RES, R_FULL, R_ANISO, R_VSYNC, R_ASSIST, R_TILT, R_FOV, R_PLAY, R_CTRL, R_QUIT, R_DL, NROWS };
 #define R_LAST_OPT R_FOV
 static const char *const labels[] = { "Game", "Game APK", "Game data (OBB)", "Resolution", "Fullscreen", "Anisotropic", "VSync",
                                       "Disable assists", "Horizon tilt", "Cockpit FOV" };
 /* apk/data: paths for the selected game; other_*: the other game's, swapped in on a switch */
 static char apk[1024], data[1024], other_apk[1024], other_data[1024], edit[1024], status[256];
 static int game = 2;
+static float g_progress = -1;                    /* 0..1 while a download or unpack runs, drawn as a bar */
+static bool g_busy;                              /* fetching game files: the buttons make way for the bar */
+static char g_bar[160];                          /* text on the bar */
 static u32 status_rgb;
 static struct { int w, h; } res[16];
 static int nres, ires, native_w = 1920, native_h = 1080;
@@ -643,16 +650,44 @@ static void arrow(GLfloat x, GLfloat cy, int dir, u32 c)
     else tri(x + 8, cy, x, cy - 6, x, cy + 6, c);
 }
 
-static void button(int x, const char *s, int on)
+static void button_w(int x, int bw, const char *s, int on)
 {
-    rrect(x - 1, BTN_Y - 1, BTN_W + 2, BTN_H + 2, 9, on ? 0x0d3a86ffu : 0x8193aaffu, on ? 0x0d3a86ffu : 0x5d6f88ffu);
-    if (on) sel_bar(x, BTN_Y, BTN_W, BTN_H);
+    rrect(x - 1, BTN_Y - 1, bw + 2, BTN_H + 2, 9, on ? 0x0d3a86ffu : 0x8193aaffu, on ? 0x0d3a86ffu : 0x5d6f88ffu);
+    if (on) sel_bar(x, BTN_Y, bw, BTN_H);
     else {
-        rrect(x, BTN_Y, BTN_W, BTN_H, 8, 0xffffffffu, 0xc5d0dcffu);
-        rrect(x + 2, BTN_Y + 1, BTN_W - 4, BTN_H / 2, 7, 0xffffffb0u, 0xffffff20u);
+        rrect(x, BTN_Y, bw, BTN_H, 8, 0xffffffffu, 0xc5d0dcffu);
+        rrect(x + 2, BTN_Y + 1, bw - 4, BTN_H / 2, 7, 0xffffffb0u, 0xffffff20u);
     }
-    text(F_BTN, x + (BTN_W - text_w(F_BTN, s)) / 2, BTN_Y + (BTN_H - fonts[F_BTN].height) / 2 + 1,
+    text(F_BTN, x + (bw - text_w(F_BTN, s)) / 2, BTN_Y + (BTN_H - fonts[F_BTN].height) / 2 + 1,
          on ? 0xffffffffu : C_NAVY, s, 0);
+}
+static void button(int x, const char *s, int on) { button_w(x, BTN_W, s, on); }
+
+/* main page buttons: RR3 adds DOWNLOAD */
+static int main_buttons(int *rows)
+{
+    int n = 0;
+    rows[n++] = R_PLAY;
+    if (game == 3) rows[n++] = R_DL;
+    rows[n++] = R_CTRL;
+    rows[n++] = R_QUIT;
+    return n;
+}
+static void main_button_box(int i, int n, int *x, int *w)
+{
+    if (n == 3) { *x = btn_x[i]; *w = BTN_W; return; }
+    *w = 170; *x = (W - (n * 170 + (n - 1) * 12)) / 2 + i * 182;
+}
+
+/* the progress bar that stands in for the buttons while game files are fetched */
+static void progress_bar(void)
+{
+    int x = PX, w = PW, y = BTN_Y, h = BTN_H;
+    rrect(x - 1, y - 1, w + 2, h + 2, 9, 0x8193aaffu, 0x5d6f88ffu);
+    rrect(x, y, w, h, 8, 0xf7f9fbffu, 0xdde4ecffu);
+    float t = g_progress < 0 ? 0 : g_progress > 1 ? 1 : g_progress;
+    if (t > 0) { rrect(x, y, 16 + (w - 16) * t, h, 8, 0x4aa3f5ffu, 0x1450b4ffu); rrect(x + 2, y + 1, (16 + (w - 16) * t) - 4, h / 2, 7, 0xffffff60u, 0xffffff18u); }
+    text(F_BOLD, x + (w - text_w(F_BOLD, g_bar)) / 2, y + (h - fonts[F_BOLD].height) / 2, t > 0.5f ? 0xffffffffu : C_NAVY, g_bar, 0);
 }
 
 static int pill(int x, const char *key, const char *what)
@@ -740,9 +775,14 @@ static void draw_main(void)
             text(F_SMALL, VX, ty, on ? 0xffffffffu : C_BLUE, buf, 0);
         }
     }
-    button(btn_x[0], "START", sel == R_PLAY);
-    button(btn_x[1], "CONTROLS", sel == R_CTRL);
-    button(btn_x[2], "EXIT", sel == R_QUIT);
+    if (g_busy) { progress_bar(); return; }
+    int rows[4], n = main_buttons(rows);
+    for (int i = 0; i < n; i++) {
+        int x, w;
+        main_button_box(i, n, &x, &w);
+        const char *label = rows[i] == R_PLAY ? "START" : rows[i] == R_DL ? "DOWNLOAD" : rows[i] == R_CTRL ? "CONTROLS" : "EXIT";
+        button_w(x, w, label, sel == rows[i]);
+    }
 }
 
 static void draw_controls(void)
@@ -775,6 +815,42 @@ static void draw_controls(void)
     button(btn_x[2], "DONE", csel_r == ACT_COUNT && csel_c != 0);
 }
 
+/* page 2: shown before DOWNLOAD fetches anything */
+#define RR3_MEGA_DATA "https://mega.nz/file/Q2ggiKSR#GZ1CXOUCs4NoHBtOiGEWOT1wau1ebhBoz6yWWWxfQyI"
+static int confirm_sel;                          /* 0 download, 1 cancel */
+static void draw_confirm(void)
+{
+    section(88, "BEFORE YOU DOWNLOAD");
+    frame(PX - 1, 111, PW + 2, 386, 0x9eb0c5ffu);
+    grad(PX, 112, PW, 384, 0xfffffff0u, 0xf4f7faf0u, 0);
+    static const char *const lines[] = {
+        "We do not own Real Racing 3 or any of its files. The game, its code, cars,",
+        "tracks and artwork belong to Electronic Arts and Firemonkeys Studios.",
+        "",
+        "The files are offered only because the game has been shut down, so that",
+        "people can keep playing it. rr2emu is not affiliated with EA.",
+        "",
+        "What gets downloaded (Real Racing 3 14.0.1, Adreno game data):",
+        "  game APK   105 MB     game data   6.2 GB, 9 GB once unpacked",
+        "",
+        "Source: the Internet Archive (archive.org), as listed by Project_RR3.",
+        "Mirror, for downloading by hand: Mega",
+    };
+    int y = 126;
+    for (unsigned i = 0; i < sizeof(lines) / sizeof(lines[0]); i++, y += 26)
+        text(i == 6 || i == 9 || i == 10 ? F_BOLD : F_BODY, PX + 18, y, C_NAVY, lines[i], 0);
+    text(F_SMALL, PX + 18, y, C_BLUE, RR3_MEGA_DATA, 0);
+    y += 34;
+    char dest[1024], m[1200];
+    home_path(dest, sizeof(dest), "XDG_DATA_HOME", ".local/share", "rr2emu/rr3-14.0.1");
+    snprintf(m, sizeof(m), "Saved in %s (resumes if interrupted)", dest);
+    char fit[1200];
+    fit_left(fit, sizeof(fit), F_SMALL, m, PW - 36);
+    text(F_SMALL, PX + 18, y, 0x4d6c93ffu, fit, 0);
+    button(btn_x[0], "DOWNLOAD", confirm_sel == 0);
+    button(btn_x[2], "CANCEL", confirm_sel == 1);
+}
+
 static void draw(void)
 {
     gl.Viewport(0, 0, W, H);
@@ -790,18 +866,24 @@ static void draw(void)
     grad(0, 74, W, 2, 0x6cc0ffffu, 0x2f7fe0ffu, 0);
     for (int i = 0; i < 3; i++) grad(W - 250 + i * 16, 18, 8, 38, 0xffffff30u, 0xffffff10u, -10);
     text(F_LOGO, 30, 14, 0xffffffffu, game == 3 ? "REAL RACING 3" : "REAL RACING 2", logo_slant);
-    const char *tag = page ? "rr2emu  CONTROLS" : "rr2emu  SETUP";
+    const char *tag = page == 1 ? "rr2emu  CONTROLS" : page == 2 ? "rr2emu  DOWNLOAD" : "rr2emu  SETUP";
     text(F_HEAD, W - 30 - text_w(F_HEAD, tag), 28, 0xbcd6f5ffu, tag, logo_slant);
 
-    if (page) draw_controls(); else draw_main();
+    if (page == 1) draw_controls(); else if (page == 2) draw_confirm(); else draw_main();
     if (*status) text(F_BODY, (W - text_w(F_BODY, status)) / 2, BTN_Y + BTN_H + 5, status_rgb, status, 0);
 
     grad(0, FOOT_Y, W, H - FOOT_Y, 0x1d2a3cffu, 0x0b121cffu, 0);
     grad(0, FOOT_Y, W, 1, 0x4d6c93ffu, 0x4d6c93ffu, 0);
     int x = 30;
-    if (page && capturing) {
+    if (g_busy) {
+        x = pill(x, "Esc", "Pause (resumes next time)");
+    } else if (page && capturing) {
         x = pill(x, "Any key / button", "Bind");
         pill(x, "Esc", "Cancel");
+    } else if (page == 2) {
+        x = pill(x, "Enter", "Select");
+        x = pill(x, "Arrows", "Change");
+        pill(x, "Esc", "Back");
     } else if (page) {
         x = pill(x, "Enter", "Bind");
         x = pill(x, "Backspace", "Clear");
@@ -843,36 +925,58 @@ static bool entry_wanted(const char *name, int apk_mode)
     return !apk_mode || !strcmp(name, SO_REL) || !strncmp(name, "assets/", 7);
 }
 
+static u64 rd64(const u8 *p) { return rd32(p) | (u64)rd32(p + 4) << 32; }
+
+static u32 crc32_buf(u32 crc, const u8 *p, size_t n)
+{
+    static u32 tab[256];
+    if (!tab[1]) for (u32 i = 0; i < 256; i++) { u32 c = i; for (int k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1; tab[i] = c; }
+    crc = ~crc;
+    while (n--) crc = tab[(crc ^ *p++) & 0xFF] ^ (crc >> 8);
+    return ~crc;
+}
+
+/* zip or zip64; every file's CRC is checked */
 static bool unzip(const char *zip, const char *dest, int apk_mode, const char *what)
 {
     int fd = open(zip, O_RDONLY | O_BINARY);
     if (fd < 0) { set_status(0xc62828ffu, "cannot open %s", zip); return false; }
-    struct stat st;
-    fstat(fd, &st);
-    u8 tail[65557];
-    off_t tl = st.st_size < (off_t)sizeof(tail) ? st.st_size : (off_t)sizeof(tail);
+    long long fsize = lseek(fd, 0, SEEK_END);
+    static u8 tail[65557];
+    long long tl = fsize < (long long)sizeof(tail) ? fsize : (long long)sizeof(tail);
     const u8 *eocd = NULL;
-    if (emu_pread(fd, tail, (size_t)tl, st.st_size - tl) == tl)
-        for (off_t i = tl - 22; i >= 0 && !eocd; i--) if (rd32(tail + i) == 0x06054b50) eocd = tail + i;
-    if (!eocd || rd32(eocd + 16) == 0xFFFFFFFFu) {
-        close(fd);
-        set_status(0xc62828ffu, "%s is not a zip archive", what);
-        return false;
+    if (emu_pread(fd, tail, (size_t)tl, fsize - tl) == tl)
+        for (long long i = tl - 22; i >= 0 && !eocd; i--) if (rd32(tail + i) == 0x06054b50) eocd = tail + i;
+    if (!eocd) { close(fd); set_status(0xc62828ffu, "%s is not a zip archive", what); return false; }
+    u64 count = rd16(eocd + 10), cd_size = rd32(eocd + 12), cd_off = rd32(eocd + 16);
+    if ((count == 0xFFFF || cd_size == 0xFFFFFFFFu || cd_off == 0xFFFFFFFFu) && eocd - tail >= 20 &&
+        rd32(eocd - 20) == 0x07064b50) {                                          /* zip64 locator -> end record */
+        u8 e64[56];
+        if (emu_pread(fd, e64, 56, (long long)rd64(eocd - 20 + 8)) == 56 && rd32(e64) == 0x06064b50) {
+            count = rd64(e64 + 32); cd_size = rd64(e64 + 40); cd_off = rd64(e64 + 48);
+        }
     }
-    u32 count = rd16(eocd + 10), cd_size = rd32(eocd + 12), cd_off = rd32(eocd + 16);
-    u8 *cd = malloc(cd_size);
-    bool ok = emu_pread(fd, cd, cd_size, cd_off) == (long)cd_size;
+    u8 *cd = cd_size < (1u << 30) ? malloc(cd_size) : NULL;
+    bool ok = cd && emu_pread(fd, cd, cd_size, (long long)cd_off) == (long)cd_size;
     if (!ok) set_status(0xc62828ffu, "cannot read %s", what);
     u64 total = 0, done = 0;
     for (int pass = 0; pass < 2 && ok; pass++) {
         const u8 *e = cd;
-        for (u32 k = 0; k < count && ok; k++) {
+        for (u64 k = 0; k < count && ok; k++) {
             if (e + 46 > cd + cd_size || rd32(e) != 0x02014b50) { ok = false; break; }
-            u16 method = rd16(e + 10), nl = rd16(e + 28);
-            u32 csize = rd32(e + 20), usize = rd32(e + 24), loff = rd32(e + 42);
+            u16 method = rd16(e + 10), nl = rd16(e + 28), xl = rd16(e + 30);
+            u32 crc = rd32(e + 16);
+            u64 csize = rd32(e + 20), usize = rd32(e + 24), loff = rd32(e + 42);
+            for (const u8 *x = e + 46 + nl; x + 4 <= e + 46 + nl + xl; x += 4 + rd16(x + 2)) {
+                if (rd16(x) != 1) continue;                                         /* zip64 extra: sizes, offset */
+                const u8 *v = x + 4;
+                if (usize == 0xFFFFFFFFu) { usize = rd64(v); v += 8; }
+                if (csize == 0xFFFFFFFFu) { csize = rd64(v); v += 8; }
+                if (loff == 0xFFFFFFFFu) loff = rd64(v);
+            }
             char name[1024];
             snprintf(name, sizeof(name), "%.*s", nl, (const char *)e + 46);
-            e += 46 + nl + rd16(e + 30) + rd16(e + 32);
+            e += 46 + nl + xl + rd16(e + 32);
             if (!entry_wanted(name, apk_mode)) continue;
             if (!pass) { total += usize; continue; }
             char path[2100];
@@ -882,36 +986,41 @@ static bool unzip(const char *zip, const char *dest, int apk_mode, const char *w
             mkdirs(path);
             path[strlen(path)] = '/';
             u8 lh[30];
-            if (emu_pread(fd, lh, 30, loff) != 30 || rd32(lh) != 0x04034b50 || (method != 0 && method != 8)) { ok = false; break; }
+            if (emu_pread(fd, lh, 30, (long long)loff) != 30 || rd32(lh) != 0x04034b50 || (method != 0 && method != 8) ||
+                csize >= (1u << 30) || usize >= (1u << 30)) { ok = false; set_status(0xc62828ffu, "unsupported entry %s", name); break; }
             long long pos = (long long)loff + 30 + rd16(lh + 26) + rd16(lh + 28);
             u8 *in = malloc(csize + 1), *out = method == 8 ? malloc(usize + 1) : in;
-            ok = in && out && emu_pread(fd, in, csize, pos) == (long)csize &&
-                 (method == 0 || inflate_raw(in, csize, out, usize) == 0);
+            ok = in && out && emu_pread(fd, in, (size_t)csize, pos) == (long)csize &&
+                 (method == 0 || inflate_raw(in, (u32)csize, out, (u32)usize) == 0);
+            if (ok && crc32_buf(0, out, (size_t)usize) != crc) { ok = false; set_status(0xc62828ffu, "%s is damaged (CRC mismatch)", name); }
             FILE *f = ok ? fopen(path, "wb") : NULL;
-            if (!f) ok = false;
-            else if (fwrite(out, 1, method == 8 ? usize : csize, f) != (method == 8 ? usize : csize)) ok = false;
+            if (ok && !f) set_status(0xc62828ffu, "cannot write %s", path);
+            if (f && fwrite(out, 1, (size_t)usize, f) != usize) ok = false;
             if (out != in) free(out);
             free(in);
             done += usize;
-            if (!f) { set_status(0xc62828ffu, "failed unpacking %s", name); break; }
-            if (fclose(f) != 0) ok = false;
+            if (!f) { ok = false; if (!*status || status_rgb != 0xc62828ffu) set_status(0xc62828ffu, "failed unpacking %s", name); break; }
+            if (fclose(f) != 0) { ok = false; set_status(0xc62828ffu, "%s", "cannot write the unpacked files (disk full?)"); }
             static struct timespec last;
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
             if ((now.tv_sec - last.tv_sec) * 1000 + (now.tv_nsec - last.tv_nsec) / 1000000 > 100) {
                 last = now;
-                char msg[128];
-                snprintf(msg, sizeof(msg), "Unpacking %s... %d%%", what, total ? (int)(done * 100 / total) : 0);
+                char msg[160];
+                g_progress = total ? (float)((double)done / (double)total) : 0;
+                snprintf(msg, sizeof(msg), "Unpacking %s... %d%%  (%.2f / %.2f GB)", what, (int)(g_progress * 100),
+                         done / 1e9, total / 1e9);
                 set_status(0x1d4f91ffu, "%s", msg);
                 draw();
                 host_swap();
                 if (pump_quit()) exit(0);
             }
-            if (!ok) set_status(0xc62828ffu, "failed unpacking %s", name);
+            if (!ok && status_rgb != 0xc62828ffu) set_status(0xc62828ffu, "failed unpacking %s", name);
         }
     }
     free(cd);
     close(fd);
+    g_progress = -1;
     if (ok) {
         char mark[1100];
         snprintf(mark, sizeof(mark), "%s/.done", dest);
@@ -1019,6 +1128,153 @@ static bool prepare(void)
     return true;
 }
 
+
+/* ---- DOWNLOAD (RR3): Real Racing 3 14.0.1 from the Internet Archive (the Project_RR3 tutorial's
+ * files): APK + Adreno game data, resumable, unpacked into ~/.local/share/rr2emu/rr3-14.0.1 ---- */
+
+static const struct { const char *url, *file, *what; u64 size; } rr3_files[] = {
+    { "https://archive.org/download/real-racing-3_14.0.1/Real%20Racing%203.apk",
+      "RealRacing3-14.0.1.apk", "game APK", 105189283ULL },
+    { "https://archive.org/download/com.ea.games.r3_row_ADRENO_14.0.1/com.ea.games.r3_row_ADRENO.zip",
+      "com.ea.games.r3_row_ADRENO.zip", "game data", 6164903864ULL },
+};
+#define RR3_DATA_UNPACKED 9002000000ULL                /* what the data zip holds */
+
+static u64 disk_free(const char *dir)
+{
+#ifdef _WIN32
+    ULARGE_INTEGER f;
+    return GetDiskFreeSpaceExA(dir, &f, NULL, NULL) ? f.QuadPart : ~0ULL;
+#else
+    struct statvfs v;
+    return statvfs(dir, &v) == 0 ? (u64)v.f_bavail * v.f_frsize : ~0ULL;
+#endif
+}
+static u64 fsize_of(const char *p) { struct stat st; return stat(p, &st) == 0 ? (u64)st.st_size : 0; }
+
+/* desktop notification, updated in place (notify-send -p / -r); nothing on Windows */
+static void notify(const char *title, const char *body, bool urgent)
+{
+#ifndef _WIN32
+    static int id = -1, have = -1;
+    if (have < 0) have = system("command -v notify-send >/dev/null 2>&1") == 0;
+    if (!have) return;
+    char cmd[1024], rep[32] = "";
+    if (id > 0) snprintf(rep, sizeof(rep), "-r %d ", id);
+    snprintf(cmd, sizeof(cmd), "notify-send -p %s-a rr2emu -i folder-download %s\"%s\" \"%s\" 2>/dev/null",
+             rep, urgent ? "-u critical " : "", title, body);
+    FILE *f = popen(cmd, "r");
+    if (!f) return;
+    int n;
+    if (fscanf(f, "%d", &n) == 1) id = n;
+    pclose(f);
+#else
+    (void)title; (void)body; (void)urgent;
+#endif
+}
+
+static void fmt_eta(char *out, size_t n, double sec)
+{
+    if (sec < 0 || sec > 360000) snprintf(out, n, "-");
+    else if (sec >= 3600) snprintf(out, n, "%dh %02dmin", (int)(sec / 3600), (int)(sec / 60) % 60);
+    else if (sec >= 60) snprintf(out, n, "%d min", (int)(sec / 60 + 0.5));
+    else snprintf(out, n, "%d s", (int)sec);
+}
+
+typedef struct { int step, steps; const char *what; int last_pct; bool stop; } fetch_ui_t;
+
+static bool fetch_progress(u64 done, u64 total, double speed, void *ud)
+{
+    fetch_ui_t *u = ud;
+    g_progress = total ? (float)((double)done / (double)total) : 0;
+    char eta[32], msg[256];
+    fmt_eta(eta, sizeof(eta), speed > 0 && total ? (double)(total - done) / speed : -1);
+    int pct = (int)(g_progress * 100);
+    snprintf(g_bar, sizeof(g_bar), "Downloading %s  %d%%   %.1f MB/s   %s left", u->what, pct, speed / 1e6, eta);
+    snprintf(msg, sizeof(msg), "Step %d of %d: %.2f of %.2f GB", u->step, u->steps, done / 1e9, total / 1e9);
+    set_status(0x1d4f91ffu, "%s", msg);
+    if (pct / 5 != u->last_pct / 5) {
+        u->last_pct = pct;
+        char body[200];
+        snprintf(body, sizeof(body), "%s: %d%% (%.2f / %.2f GB), %s left", u->what, pct, done / 1e9, total / 1e9, eta);
+        notify("Real Racing 3: downloading", body, false);
+    }
+    draw();
+    if (getenv("RR2_LAUNCHER_SHOT")) glhost_screenshot(getenv("RR2_LAUNCHER_SHOT"), W, H);
+    host_swap();
+    menu_event_t ev = { 0 };
+    int e;
+    while ((e = host_menu_poll(0, &ev)) >= 0)
+        if (e == MENU_BACK || e == MENU_QUIT) u->stop = true;
+    return !u->stop;
+}
+
+/* returns true once the APK and data are in place and the paths saved */
+static bool rr3_fetch(void)
+{
+    char dest[1024], apk_path[1300], zip_path[1300], data_dir[1300], mark[1400], err[256];
+    home_path(dest, sizeof(dest), "XDG_DATA_HOME", ".local/share", "rr2emu/rr3-14.0.1");
+    mkdirs(dest);
+    snprintf(apk_path, sizeof(apk_path), "%s/%s", dest, rr3_files[0].file);
+    snprintf(zip_path, sizeof(zip_path), "%s/%s", dest, rr3_files[1].file);
+    snprintf(data_dir, sizeof(data_dir), "%s/data", dest);
+    snprintf(mark, sizeof(mark), "%s/.done", data_dir);
+    bool need_apk = fsize_of(apk_path) != rr3_files[0].size, need_data = !is_file(mark);
+    bool need_zip = need_data && fsize_of(zip_path) != rr3_files[1].size;
+
+    char part[1400];
+    u64 need = 256u << 20;
+    snprintf(part, sizeof(part), "%s.part", apk_path);
+    if (need_apk) need += rr3_files[0].size - fsize_of(part);
+    snprintf(part, sizeof(part), "%s.part", zip_path);
+    if (need_zip) need += rr3_files[1].size - fsize_of(part);
+    if (need_data) need += RR3_DATA_UNPACKED;
+    u64 avail = disk_free(dest);
+    if (avail < need) {
+        char m[300];
+        snprintf(m, sizeof(m), "Not enough space in %s: needs %.1f GB, %.1f GB free", dest, need / 1e9, avail / 1e9);
+        set_status(0xc62828ffu, "%s", m);
+        return false;
+    }
+
+    g_busy = true;
+    fetch_ui_t u = { .steps = 3, .last_pct = -5 };
+    int rc = DL_OK;
+    notify("Real Racing 3: downloading", "Starting (6.3 GB). You can keep using the computer.", false);
+    for (int i = 0; i < 2 && rc == DL_OK; i++) {
+        if (i == 0 ? !need_apk : !need_zip) continue;
+        u.step = i + 1; u.what = rr3_files[i].what; u.last_pct = -5;
+        rc = http_download(rr3_files[i].url, i == 0 ? apk_path : zip_path, rr3_files[i].size, fetch_progress, &u, err, sizeof(err));
+    }
+    if (rc == DL_OK && need_data) {
+        snprintf(g_bar, sizeof(g_bar), "Unpacking game data");
+        notify("Real Racing 3: unpacking", "Unpacking 9 GB of game data...", false);
+        if (!unzip(zip_path, data_dir, 0, "game data")) rc = DL_ERROR, snprintf(err, sizeof(err), "%s", status);
+        else remove(zip_path);                        /* the unpacked copy is what the game reads */
+    }
+    g_busy = false;
+    g_progress = -1;
+    if (rc == DL_CANCELLED) {
+        set_status(0x1d4f91ffu, "%s", "Paused. DOWNLOAD again to continue where it stopped.");
+        notify("Real Racing 3: paused", "Press DOWNLOAD in rr2emu to continue.", false);
+        return false;
+    }
+    if (rc != DL_OK) {
+        char m[320];
+        snprintf(m, sizeof(m), "Download failed: %s", err);
+        set_status(0xc62828ffu, "%s", m);
+        notify("Real Racing 3: download failed", err, true);
+        return false;
+    }
+    snprintf(apk, sizeof(apk), "%s", apk_path);
+    snprintf(data, sizeof(data), "%s", data_dir);
+    cfg_save();
+    set_status(0x2e7d32ffu, "%s", "Real Racing 3 14.0.1 ready. Paths saved: press START");
+    notify("Real Racing 3 is ready", data_dir, false);
+    sel = R_PLAY;
+    return true;
+}
+
 /* ---- input ---- */
 
 static void clean_path(char *dst, size_t n, const char *src)
@@ -1038,7 +1294,10 @@ static int hit(int x, int y)
 {
     for (int i = 0; i <= R_LAST_OPT; i++) if (x >= PX && x < PX + PW && y >= row_top[i] && y < row_top[i] + ROW_H) return i;
     if (y >= BTN_Y && y < BTN_Y + BTN_H)
-        for (int b = 0; b < 3; b++) if (x >= btn_x[b] && x < btn_x[b] + BTN_W) return R_PLAY + b;
+    {
+        int rows[4], n = main_buttons(rows);
+        for (int b = 0; b < n; b++) { int bx, bw; main_button_box(b, n, &bx, &bw); if (x >= bx && x < bx + bw) return rows[b]; }
+    }
     return -1;
 }
 
@@ -1063,6 +1322,7 @@ static void change_game(void)
     memcpy(t, apk, sizeof(t)); memcpy(apk, other_apk, sizeof(t)); memcpy(other_apk, t, sizeof(t));
     memcpy(t, data, sizeof(t)); memcpy(data, other_data, sizeof(t)); memcpy(other_data, t, sizeof(t));
     game = game == 2 ? 3 : 2;
+    if (sel == R_DL) sel = R_PLAY;
     *status = 0;
 }
 
@@ -1082,7 +1342,11 @@ static void change(int d)
         if (G.cockpit_fov < FOV_MIN) G.cockpit_fov = FOV_MIN;
         if (G.cockpit_fov > FOV_MAX) G.cockpit_fov = FOV_MAX;
         break;
-    case R_PLAY: case R_CTRL: case R_QUIT: sel = R_PLAY + (sel - R_PLAY + d + 3) % 3; return;
+    case R_PLAY: case R_CTRL: case R_QUIT: case R_DL: {
+        int rows[4], n = main_buttons(rows), i = 0;
+        while (i < n && rows[i] != sel) i++;
+        sel = rows[(i + d + n) % n];
+        return; }
     default: return;
     }
     cfg_save();
@@ -1150,6 +1414,25 @@ static int handle_controls(int e, menu_event_t *ev)
 static int handle(int e, menu_event_t *ev)
 {
     if (e == MENU_QUIT) return -1;
+    if (page == 2) {
+        switch (e) {
+        case MENU_LEFT: case MENU_RIGHT: confirm_sel ^= 1; break;
+        case MENU_BACK: page = 0; break;
+        case MENU_MOVE: case MENU_CLICK:
+            if (ev->y >= BTN_Y && ev->y < BTN_Y + BTN_H) {
+                int b = ev->x >= btn_x[0] && ev->x < btn_x[0] + BTN_W ? 0 : ev->x >= btn_x[2] && ev->x < btn_x[2] + BTN_W ? 1 : -1;
+                if (b < 0) break;
+                confirm_sel = b;
+                if (e == MENU_MOVE) break;
+            } else break;
+            /* fall through */
+        case MENU_OK:
+            page = 0;
+            if (confirm_sel == 0) return 2;
+            break;
+        }
+        return 0;
+    }
     if (page) return handle_controls(e, ev);
     if (e == MENU_DROP) {
         size_t l = strlen(ev->text);
@@ -1200,6 +1483,7 @@ static int handle(int e, menu_event_t *ev)
         if (h < 0) break;
         sel = h;
         if (h == R_APK || h == R_DATA) edit_begin();
+        else if (h == R_DL) { page = 2; confirm_sel = 0; }
         else if (h == R_PLAY) return 1;
         else if (h == R_QUIT) return -1;
         else if (h == R_CTRL) { page = 1; csel_r = csel_c = 0; }
@@ -1207,6 +1491,7 @@ static int handle(int e, menu_event_t *ev)
         break; }
     case MENU_OK:
         if (sel == R_APK || sel == R_DATA) edit_begin();
+        else if (sel == R_DL) { page = 2; confirm_sel = 0; }
         else if (sel == R_PLAY) return 1;
         else if (sel == R_QUIT) return -1;
         else if (sel == R_CTRL) { page = 1; csel_r = csel_c = 0; }
@@ -1243,6 +1528,7 @@ bool launcher_run(const char **so_path)
         for (int e = host_menu_poll(1000, &ev); e >= 0 && !r; ev.capture = capturing, e = host_menu_poll(0, &ev))
             r = handle(e, &ev);
         if (r < 0) { gl_teardown(); return false; }
+        if (r == 2) { rr3_fetch(); continue; }
         if (r > 0) {
             set_status(0x1d4f91ffu, "%s", "Checking game files...");
             draw();
@@ -1255,6 +1541,11 @@ bool launcher_run(const char **so_path)
     *so_path = so_buf;
     G.game = game;
     if (game == 3) {
+        /* the downloaded 14.0.1 install keeps its own saves, apart from any other RR3 version's */
+        static char save3[1100];
+        char dest[1024];
+        home_path(dest, sizeof(dest), "XDG_DATA_HOME", ".local/share", "rr2emu/rr3-14.0.1");
+        if (!strncmp(data_buf, dest, strlen(dest))) { snprintf(save3, sizeof(save3), "%s/save", dest); G.save_dir = save3; }
         G.rr3_apk_dir = rr3_apk_buf;
         G.rr3_base_apk = *rr3_base_buf ? rr3_base_buf : NULL;
         G.rr3_sdcard_dir = rr3_sd_buf;

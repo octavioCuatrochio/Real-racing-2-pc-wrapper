@@ -5,7 +5,7 @@ LDLIBS   = -lpthread -lm -ldl -rdynamic
 # release builds: no -march=native, so they run on any x86-64 CPU (the JIT only emits baseline SSE2)
 RELEASE_CFLAGS = -O2 -D_GNU_SOURCE -std=c11 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -fno-strict-aliasing
 
-SRCS = main.c mem.c cpu.c arm.c arm7.c dec.c thumb.c neon.c jit.c vfp.c elf.c hle.c hle_libc.c hle_malloc.c hle_sync.c jni.c gles.c glhost.c host.c patches.c launcher.c inflate.c win32.c test.c difftest.c rr3.c stbtt.c opensl.c
+SRCS = main.c mem.c cpu.c arm.c arm7.c dec.c thumb.c neon.c jit.c vfp.c elf.c hle.c hle_libc.c hle_malloc.c hle_sync.c jni.c gles.c glhost.c host.c patches.c launcher.c inflate.c win32.c test.c difftest.c rr3.c stbtt.c opensl.c download.c
 OBJS = $(SRCS:.c=.o)
 
 rr2emu: $(OBJS)
@@ -26,7 +26,7 @@ WINOBJS  = $(SRCS:%.c=build-win/%.o)
 win: rr2emu.exe
 
 rr2emu.exe: $(WINOBJS)
-	$(WINCC) $(WINFLAGS) -mwindows -static -o $@ $(WINOBJS) -lpthread -lwinmm -lgdi32
+	$(WINCC) $(WINFLAGS) -mwindows -static -o $@ $(WINOBJS) -lpthread -lwinmm -lgdi32 -lwinhttp
 
 build-win/%.o: %.c emu.h fastops.h vfpops.h platform.h
 	@mkdir -p build-win
