@@ -13,6 +13,7 @@
 #include "fastops.h"
 #include <stddef.h>
 #include <sys/mman.h>
+#include <xmmintrin.h>
 
 #define JIT_CACHE      (64u << 20)
 #define JIT_MAX_INSNS  64
@@ -257,12 +258,43 @@ static const di_t *g_fb_di;
 /* data-processing immediate the ARM word cannot encode (Thumb modified immediates) */
 static bool g_ovr; static u32 g_ovr_v; static int g_ovr_rot;
 
+/* RR2_JIT_STATS=1: count handler calls from JIT code per (handler, op, insn class) */
+#include <dlfcn.h>
+static struct { void *fn; int op; u32 key; u64 n; } g_js[4096];
+static int g_js_on = -1, g_njs;
+static void js_dump(void)
+{
+    u64 tot = 0;
+    for (int i = 0; i < g_njs; i++) tot += g_js[i].n;
+    fprintf(stderr, "[jit] %llu handler calls from JIT code\n", (unsigned long long)tot);
+    for (int r = 0; r < 40; r++) {
+        int b = -1;
+        for (int i = 0; i < g_njs; i++) if (g_js[i].n && (b < 0 || g_js[i].n > g_js[b].n)) b = i;
+        if (b < 0) break;
+        Dl_info di;
+        const char *nm = dladdr(g_js[b].fn, &di) && di.dli_sname ? di.dli_sname : "?";
+        fprintf(stderr, "  %6.2f%%  %-22s op %4d  %08x\n", 100.0 * g_js[b].n / (tot + !tot), nm, g_js[b].op, g_js[b].key);
+        g_js[b].n = 0;
+    }
+}
+static void js_count(void *fn, int op, u32 key)
+{
+    if (g_js_on < 0) { g_js_on = getenv("RR2_JIT_STATS") != NULL; if (g_js_on) atexit(js_dump); }
+    if (!g_js_on) return;
+    int i;
+    for (i = 0; i < g_njs; i++) if (g_js[i].fn == fn && g_js[i].op == op && g_js[i].key == key) break;
+    if (i == g_njs) { if (g_njs == 4096) return; g_js[g_njs].fn = fn; g_js[g_njs].op = op; g_js[g_njs].key = key; g_njs++; }
+    mov_ri64(RAX, (u64)(uintptr_t)&g_js[i].n);
+    e8(0x48); e8(0xFF); e8(0x00);               /* inc qword [rax] */
+}
+
 /* fallback: run the interpreter's handler for this instruction */
 static void emit_call_handler(cpu_t *dummy, u32 pc, const di_t *src)
 {
     (void)dummy;
     di_t *d = malloc(sizeof(*d));               /* lives as long as the code */
     *d = *src;
+    js_count((void *)(d->op == OP_generic ? (dfn_t)d_generic : d->h), d->op, ((d->insn >> 25) & 7) >= 6 ? d->insn & 0x0FFF0FF0u : d->insn & 0x0FF000F0u);
     st_imm(OFF_R(15), g_next);
     e8(0x48); e8(0x89); e8(0xDF);               /* mov rdi, rbx */
     mov_ri64(RSI, (u64)(uintptr_t)d);
@@ -646,6 +678,407 @@ static bool emit_vfp(u32 insn, u32 pc)
 /* compare + branch fusion                                             */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* NEON: vld1/vst1, f32 arithmetic, bitwise, immediates               */
+/* ------------------------------------------------------------------ */
+
+u64 neon_expand_imm(u32 op, u32 cmode, u32 imm8, bool *ok);
+
+#define NVD(i) ((((i) >> 18) & 0x10) | (((i) >> 12) & 0xF))
+#define NVN(i) ((((i) >> 3) & 0x10) | (((i) >> 16) & 0xF))
+#define NVM(i) ((((i) >> 1) & 0x10) | ((i) & 0xF))
+
+/* NEON float runs with FZ+DN: MXCSR FTZ|DAZ while a run of them executes */
+static u32 g_mx[2];
+static bool g_mx_on;
+static void mx_emit(int on) { mov_ri64(RAX, (u64)(uintptr_t)&g_mx[on]); e8(0x0F); e8(0xAE); e8(0x10); g_mx_on = on; }
+
+static void x_rbx(u8 pfx, u8 op, int x, s32 off) { if (pfx) e8(pfx); u8 o[2] = { 0x0F, op }; mrm_rbx(0, o, 2, x, off); }
+static void x_rr(u8 pfx, u8 op, int d, int s) { if (pfx) e8(pfx); u8 o[2] = { 0x0F, op }; mrm_rr(0, o, 2, d, s, false); }
+static void x_mem(u8 pfx, u8 op, int x, int idx)
+{
+    if (pfx) e8(pfx);
+    rex(0, x, idx, R15, false);
+    e8(0x0F); e8(op); e8(0x04 | ((x & 7) << 3)); e8(((idx & 7) << 3) | (R15 & 7));
+}
+static void x_shi(u8 ext, int x, u8 n) { e8(0x66); e8(0x0F); e8(0x72); e8(0xC0 | (ext << 3) | (x & 7)); e8(n); }   /* psrld/pslld */
+static void ld_vec(int x, u32 reg, bool q) { if (q) x_rbx(0, 0x10, x, OFF_D(reg)); else x_rbx(0xF3, 0x7E, x, OFF_D(reg)); }
+static void st_vec(int x, u32 reg, bool q) { if (q) x_rbx(0, 0x11, x, OFF_D(reg)); else x_rbx(0x66, 0xD6, x, OFF_D(reg)); }
+static void and64_rr(int d, int s) { static const u8 o[] = { 0x21 }; mrm_rr(1, o, 1, s, d, false); }
+
+enum { NF_NONE, NF_ADD, NF_SUB, NF_MUL, NF_MLA, NF_MLS };
+/* f32 forms emitted natively (and only those need the MXCSR switch) */
+static int neon_fop(u32 insn, bool *scalar)
+{
+    *scalar = false;
+    if ((insn & 0xFE000000u) != 0xF2000000u) return NF_NONE;
+    u32 U = (insn >> 24) & 1, A = (insn >> 8) & 0xF, B = (insn >> 4) & 1, C = (insn >> 20) & 3, Q = (insn >> 6) & 1;
+    if (!(insn & (1u << 23))) {                                    /* three same */
+        if (A != 13 || (C & 1)) return NF_NONE;
+        if (Q && ((NVD(insn) | NVN(insn) | NVM(insn)) & 1)) return NF_NONE;
+        bool op = C & 2;
+        if (!U && !B) return op ? NF_SUB : NF_ADD;
+        if (!U && B) return op ? NF_MLS : NF_MLA;
+        if (U && B && !op) return NF_MUL;
+        return NF_NONE;
+    }
+    /* two registers and a scalar: 1111 001Q 1Dsz nnnn dddd AAAA N1M0 mmmm */
+    if (((insn >> 20) & 3) != 2 || (insn & 0x50) != 0x40 || (((insn >> 19) & 0x16) == 0x16)) return NF_NONE;
+    if (U && ((NVD(insn) | NVN(insn)) & 1)) return NF_NONE;
+    *scalar = true;
+    return A == 9 ? NF_MUL : A == 1 ? NF_MLA : A == 5 ? NF_MLS : NF_NONE;
+}
+static bool neon_needs_mx(u32 insn) { bool s; return neon_fop(insn, &s) != NF_NONE; }
+
+static bool emit_neon_float(u32 insn)
+{
+    bool scalar;
+    int f = neon_fop(insn, &scalar);
+    if (f == NF_NONE) return false;
+    bool q = scalar ? (insn >> 24) & 1 : (insn >> 6) & 1;
+    u32 d = NVD(insn), n = NVN(insn), m = NVM(insn);
+    ld_vec(0, n, q);
+    if (scalar) {
+        u32 mreg = insn & 0xF, idx = (insn >> 5) & 1;
+        sse_ss(0x10, 1, OFF_S(mreg * 2 + idx));
+        x_rr(0, 0xC6, 1, 1); e8(0);                                 /* shufps xmm1, xmm1, 0 */
+    } else ld_vec(1, m, q);
+    int r = 0;
+    switch (f) {
+    case NF_ADD: x_rr(0, 0x58, 0, 1); break;
+    case NF_SUB: x_rr(0, 0x5C, 0, 1); break;
+    case NF_MUL: x_rr(0, 0x59, 0, 1); break;
+    default:
+        x_rr(0, 0x59, 0, 1);
+        ld_vec(1, d, q);
+        x_rr(0, f == NF_MLA ? 0x58 : 0x5C, 1, 0);
+        r = 1;
+        break;
+    }
+    /* NaN lanes -> default NaN 0x7FC00000 */
+    x_rr(0, 0x28, 2, r); x_rr(0, 0xC2, 2, 2); e8(3);               /* xmm2 = unord(r, r) */
+    x_rr(0x66, 0x76, 3, 3); x_shi(2, 3, 23); x_shi(6, 3, 22);       /* xmm3 = 0x7FC00000 */
+    x_rr(0, 0x54, 3, 2);                                           /* andps 3, 2 */
+    x_rr(0, 0x55, 2, r);                                           /* andnps 2, r */
+    x_rr(0, 0x56, 2, 3);                                           /* orps 2, 3 */
+    st_vec(2, d, q);
+    return true;
+}
+
+static bool emit_neon_bitwise(u32 insn)
+{
+    /* 1111 001U 0DCC nnnn dddd 0001 NQM1 mmmm */
+    if ((insn & 0xFE800F10u) != 0xF2000110u) return false;
+    u32 U = (insn >> 24) & 1, C = (insn >> 20) & 3, q = (insn >> 6) & 1;
+    u32 d = NVD(insn), n = NVN(insn), m = NVM(insn);
+    if (q && ((d | n | m) & 1)) return false;
+    ld_vec(0, n, q); ld_vec(1, m, q);
+    if (!U) {
+        switch (C) {
+        case 0: x_rr(0, 0x54, 0, 1); break;                        /* vand */
+        case 1: x_rr(0, 0x55, 1, 0); x_rr(0, 0x28, 0, 1); break;   /* vbic: ~m & n */
+        case 2: x_rr(0, 0x56, 0, 1); break;                        /* vorr */
+        default: x_rr(0x66, 0x76, 2, 2); x_rr(0, 0x57, 1, 2); x_rr(0, 0x56, 0, 1); break;   /* vorn */
+        }
+    } else if (C == 0) x_rr(0, 0x57, 0, 1);                        /* veor */
+    else {
+        ld_vec(2, d, q);
+        /* vbsl: m ^ ((n ^ m) & d)   vbit: d ^ ((n ^ d) & m)   vbif: n ^ ((d ^ n) & m) */
+        int base = C == 1 ? 1 : C == 2 ? 2 : 0, other = C == 1 ? 0 : C == 2 ? 0 : 2, sel = C == 1 ? 2 : 1;
+        x_rr(0, 0x28, 3, other); x_rr(0, 0x57, 3, base); x_rr(0, 0x54, 3, sel); x_rr(0, 0x57, 3, base);
+        x_rr(0, 0x28, 0, 3);
+    }
+    st_vec(0, d, q);
+    return true;
+}
+
+static bool emit_neon_imm(u32 insn)
+{
+    /* 1111 001i 1D00 0iii dddd cmode 0Qo1 iiii */
+    if ((insn & 0xFEB80090u) != 0xF2800010u) return false;
+    u32 op = (insn >> 5) & 1, cmode = (insn >> 8) & 0xF, q = (insn >> 6) & 1, d = NVD(insn);
+    u32 imm8 = ((insn >> 17) & 0x80) | ((insn >> 12) & 0x70) | (insn & 0xF);
+    if (q && (d & 1)) return false;
+    bool ok;
+    u64 imm = neon_expand_imm(op, cmode, imm8, &ok);
+    if (!ok) return false;
+    bool orr_bic = (cmode & 1) && cmode < 12;
+    u64 v = !op ? imm : cmode == 14 ? imm : ~imm;
+    if (orr_bic) mov_ri64(RDX, op ? ~imm : imm); else mov_ri64(RDX, v);
+    for (u32 i = 0; i <= q; i++) {
+        if (orr_bic) { ld64_rbx(RAX, OFF_D(d + i)); if (op) and64_rr(RAX, RDX); else or64_rr(RAX, RDX); st64_rbx(RAX, OFF_D(d + i)); }
+        else st64_rbx(RDX, OFF_D(d + i));
+    }
+    return true;
+}
+
+static void neon_writeback(u32 rn, u32 rm, u32 bytes)
+{
+    if (rm == 15) return;
+    ld_r(RAX, OFF_R(rn));
+    if (rm == 13) alu_ri(0, RAX, bytes);
+    else { ld_r(RDX, OFF_R(rm)); alu_rr(0, RAX, RDX); }
+    st_r(RAX, OFF_R(rn));
+}
+
+static bool emit_neon_ls(u32 insn)
+{
+    if ((insn & 0xFF100000u) != 0xF4000000u) return false;
+    u32 A = (insn >> 23) & 1, L = (insn >> 21) & 1, rn = (insn >> 16) & 0xF, rm = insn & 0xF, d = NVD(insn);
+    if (rn == 15) return false;
+    if (!A) {                                                       /* vld1/vst1 multiple, contiguous */
+        u32 type = (insn >> 8) & 0xF, regs;
+        switch (type) { case 7: regs = 1; break; case 10: regs = 2; break; case 6: regs = 3; break; case 2: regs = 4; break; default: return false; }
+        if (d + regs > 32) return false;
+        ld_r(RCX, OFF_R(rn));
+        u32 off = 0;
+        for (u32 i = 0; i < regs; ) {
+            if (off) alu_ri(0, RCX, off), off = 0;
+            if (regs - i >= 2) {
+                if (L) { x_mem(0, 0x10, 0, RCX); x_rbx(0, 0x11, 0, OFF_D(d + i)); }
+                else { x_rbx(0, 0x10, 0, OFF_D(d + i)); x_mem(0, 0x11, 0, RCX); }
+                i += 2; off = 16;
+            } else {
+                if (L) { gld64(RAX, RCX); st64_rbx(RAX, OFF_D(d + i)); }
+                else { ld64_rbx(RAX, OFF_D(d + i)); gst64(RAX, RCX); }
+                i += 1; off = 8;
+            }
+        }
+        neon_writeback(rn, rm, regs * 8);
+        return true;
+    }
+    if ((insn >> 8) & 3) return false;                              /* only one-element structures */
+    u32 sz = (insn >> 10) & 3;
+    if (sz == 3) {                                                  /* vld1 to all lanes */
+        u32 s2 = (insn >> 6) & 3, T = (insn >> 5) & 1;
+        if (!L || s2 == 3 || d + T >= 32) return false;
+        ld_r(RCX, OFF_R(rn));
+        if (s2 == 0) { gldu8(RAX, RCX); rex(0, RAX, 0, RAX, false); e8(0x69); e8(0xC0); e32(0x01010101u); }
+        else if (s2 == 1) { gldu16(RAX, RCX); rex(0, RAX, 0, RAX, false); e8(0x69); e8(0xC0); e32(0x00010001u); }
+        else gld32(RAX, RCX);
+        mov_rr(RDX, RAX); shl64_ri(RDX, 32); or64_rr(RAX, RDX);
+        st64_rbx(RAX, OFF_D(d));
+        if (T) st64_rbx(RAX, OFF_D(d + 1));
+        neon_writeback(rn, rm, 1u << s2);
+        return true;
+    }
+    ld_r(RCX, OFF_R(rn));
+    u32 ia = (insn >> 4) & 0xF, idx = sz == 0 ? ia >> 1 : sz == 1 ? ia >> 2 : ia >> 3;
+    s32 lane = OFF_D(d) + (s32)(idx << sz);
+    if (L) {
+        if (sz == 0) { gldu8(RAX, RCX); static const u8 o[] = { 0x88 }; mrm_rbx(0, o, 1, RAX, lane); }
+        else if (sz == 1) { gldu16(RAX, RCX); e8(0x66); static const u8 o[] = { 0x89 }; mrm_rbx(0, o, 1, RAX, lane); }
+        else { gld32(RAX, RCX); st_r(RAX, lane); }
+    } else {
+        ld_r(RAX, lane);
+        if (sz == 0) gst8(RAX, RCX); else if (sz == 1) gst16(RAX, RCX); else gst32(RAX, RCX);
+    }
+    neon_writeback(rn, rm, 1u << sz);
+    return true;
+}
+
+static bool emit_neon(u32 insn)
+{
+    if ((insn & 0xFF100000u) == 0xF4000000u) return emit_neon_ls(insn);
+    if ((insn & 0xFE000000u) != 0xF2000000u) return false;
+    return emit_neon_float(insn) || emit_neon_bitwise(insn) || emit_neon_imm(insn);
+}
+
+/* ------------------------------------------------------------------ */
+/* ARMv6/v7 media, movw/movt, more VFP (D32, f64, moves)              */
+/* ------------------------------------------------------------------ */
+
+static void movsx8(int d, int s) { static const u8 o[] = { 0x0F, 0xBE }; mrm_rr(0, o, 2, d, s, s >= 4); }
+static void movzx16(int d, int s) { static const u8 o[] = { 0x0F, 0xB7 }; mrm_rr(0, o, 2, d, s, false); }
+static void movsx16(int d, int s) { static const u8 o[] = { 0x0F, 0xBF }; mrm_rr(0, o, 2, d, s, false); }
+
+static bool emit_arm7(u32 insn)
+{
+    u32 rd = (insn >> 12) & 0xF;
+    if ((insn & 0x0FB00000u) == 0x03000000u) {                     /* movw / movt */
+        if (rd == 15) return false;
+        u32 imm = ((insn >> 4) & 0xF000) | (insn & 0xFFF);
+        if (!(insn & (1u << 22))) { st_imm(OFF_R(rd), imm); return true; }
+        ld_r(RAX, OFF_R(rd)); alu_ri(4, RAX, 0xFFFF); alu_ri(1, RAX, imm << 16); st_r(RAX, OFF_R(rd));
+        return true;
+    }
+    if ((insn & 0x0F8003F0u) == 0x06800070u) {                     /* sxt/uxt{a}{b,h} */
+        u32 op = (insn >> 20) & 7, rn = (insn >> 16) & 0xF, rm = insn & 0xF, rot = (insn >> 10) & 3;
+        if (op != 2 && op != 3 && op != 6 && op != 7) return false;   /* no *xtb16 */
+        if (rd == 15 || rm == 15) return false;
+        ld_r(RAX, OFF_R(rm));
+        if (rot) sh_ri(1, RAX, (u8)(rot * 8));
+        if (op == 2) movsx8(RAX, RAX); else if (op == 3) movsx16(RAX, RAX);
+        else if (op == 6) movzx8(RAX, RAX); else movzx16(RAX, RAX);
+        if (rn != 15) { ld_r(RDX, OFF_R(rn)); alu_rr(0, RAX, RDX); }
+        st_r(RAX, OFF_R(rd));
+        return true;
+    }
+    if ((insn & 0x0FA00070u) == 0x07A00050u) {                     /* ubfx / sbfx */
+        u32 w = ((insn >> 16) & 0x1F) + 1, lsb = (insn >> 7) & 0x1F, rn = insn & 0xF;
+        if (rd == 15 || rn == 15 || lsb + w > 32) return false;
+        ld_r(RAX, OFF_R(rn));
+        if (insn & (1u << 22)) {
+            if (lsb) sh_ri(5, RAX, (u8)lsb);
+            if (w < 32) alu_ri(4, RAX, (1u << w) - 1);
+        } else {
+            if (32 - lsb - w) sh_ri(4, RAX, (u8)(32 - lsb - w));
+            if (w < 32) sh_ri(7, RAX, (u8)(32 - w));
+        }
+        st_r(RAX, OFF_R(rd));
+        return true;
+    }
+    if ((insn & 0x0FE00070u) == 0x07C00010u) {                     /* bfi / bfc */
+        u32 msb = (insn >> 16) & 0x1F, lsb = (insn >> 7) & 0x1F, rn = insn & 0xF;
+        if (rd == 15 || msb < lsb) return false;
+        u32 mask = (msb - lsb == 31 ? ~0u : ((1u << (msb - lsb + 1)) - 1)) << lsb;
+        ld_r(RAX, OFF_R(rd)); alu_ri(4, RAX, ~mask);
+        if (rn != 15) {
+            ld_r(RDX, OFF_R(rn));
+            if (lsb) sh_ri(4, RDX, (u8)lsb);
+            alu_ri(4, RDX, mask); alu_rr(1, RAX, RDX);
+        }
+        st_r(RAX, OFF_R(rd));
+        return true;
+    }
+    return false;
+}
+
+static u32 vfp_imm32(u32 imm8)
+{
+    return (imm8 & 0x80) << 24 | ((imm8 & 0x40) ? 0x3E000000u : 0x40000000u) | (imm8 & 0x3F) << 19;
+}
+static u64 vfp_imm64(u32 imm8)
+{
+    return (u64)(imm8 & 0x80) << 56 | ((imm8 & 0x40) ? 0x3FC0000000000000ULL : 0x4000000000000000ULL) | (u64)(imm8 & 0x3F) << 48;
+}
+static void sd_rbx(u8 op, int x, s32 off) { e8(0xF2); u8 o[2] = { 0x0F, op }; mrm_rbx(0, o, 2, x, off); }
+static void ucomisd_rr(int a, int b) { e8(0x66); static const u8 o[] = { 0x0F, 0x2E }; mrm_rr(0, o, 2, a, b, false); }
+
+/* vcmp result (flags from ucomis*) -> FPSCR NZCV, same table as the f32 path */
+static void emit_cmp_to_fpscr(void)
+{
+    setcc(0xA, RAX); setcc(CC_E, RDX); setcc(CC_B, RCX);
+    movzx8(RAX, RAX); movzx8(RDX, RDX); movzx8(RCX, RCX);
+    sh_ri(4, RAX, 2); sh_ri(4, RDX, 1); alu_rr(1, RAX, RDX); alu_rr(1, RAX, RCX);
+    sh_ri(4, RAX, 2); mov_rr(RCX, RAX);
+    mov_ri(RDX, 0x30000682u);
+    rex(0, 0, 0, RDX, false); e8(0xD3); e8(0xE8 | (RDX & 7));
+    alu_ri(4, RDX, 0xF); sh_ri(4, RDX, 28);
+    ld_r(RAX, OFF_FPSCR); alu_ri(4, RAX, 0x0FFFFFFFu); alu_rr(1, RAX, RDX); st_r(RAX, OFF_FPSCR);
+}
+
+static bool emit_vfp2(u32 insn, u32 pc)
+{
+    u32 cls = (insn >> 25) & 7, cp = (insn >> 8) & 0xF;
+    if (cp != 10 && cp != 11) return false;
+    bool dbl = cp == 11;
+    u32 D = (insn >> 22) & 1, N = (insn >> 7) & 1, M = (insn >> 5) & 1;
+    u32 vn = (insn >> 16) & 0xF, vd = (insn >> 12) & 0xF, vm = insn & 0xF;
+    u32 sd = (vd << 1) | D, sm = (vm << 1) | M, dd = (D << 4) | vd, dn = (N << 4) | vn, dm = (M << 4) | vm;
+    if (cls == 6) {                                                 /* vmov two core regs <-> d / s pair */
+        if ((insn & 0x0FE000D0u) != 0x0C400010u) return false;
+        u32 L = (insn >> 20) & 1, rt = vd, rt2 = vn;
+        if (rt == 15 || rt2 == 15 || (L && rt == rt2)) return false;
+        s32 lo = dbl ? OFF_D(dm) : OFF_S(sm), hi = lo + 4;
+        if (!dbl && sm == 31) return false;
+        if (L) { ld_r(RAX, lo); ld_r(RDX, hi); st_r(RAX, OFF_R(rt)); st_r(RDX, OFF_R(rt2)); }
+        else { ld_r(RAX, OFF_R(rt)); ld_r(RDX, OFF_R(rt2)); st_r(RAX, lo); st_r(RDX, hi); }
+        return true;
+    }
+    if (cls != 7 || (insn & (1u << 24)) || (insn & 0x10)) return false;
+    u32 vop = (((insn >> 23) & 1) << 2) | ((insn >> 20) & 3), b6 = (insn >> 6) & 1;
+    if (vop == 7) {
+        if (!b6) {                                                  /* vmov immediate */
+            u32 imm8 = (vn << 4) | vm;
+            if (dbl) { mov_ri64(RAX, vfp_imm64(imm8)); st64_rbx(RAX, OFF_D(dd)); }
+            else st_imm(OFF_S(sd), vfp_imm32(imm8));
+            return true;
+        }
+        u32 N7 = (insn >> 7) & 1;
+        if (vn == 0 || vn == 1) {                                   /* vmov reg / vabs / vneg */
+            if (vn == 1 && N7) return false;                        /* vsqrt */
+            if (dbl) {
+                ld64_rbx(RAX, OFF_D(dm));
+                if (vn == 1 || N7) {
+                    mov_ri64(RDX, vn == 1 ? 0x8000000000000000ULL : 0x7FFFFFFFFFFFFFFFULL);
+                    if (vn == 1) { static const u8 o[] = { 0x31 }; mrm_rr(1, o, 1, RDX, RAX, false); }
+                    else and64_rr(RAX, RDX);
+                }
+                st64_rbx(RAX, OFF_D(dd));
+            } else {
+                ld_r(RAX, OFF_S(sm));
+                if (vn == 1) alu_ri(6, RAX, 0x80000000u);
+                else if (N7) alu_ri(4, RAX, 0x7FFFFFFFu);
+                st_r(RAX, OFF_S(sd));
+            }
+            return true;
+        }
+        if ((vn == 4 || vn == 5) && dbl) {                          /* vcmp(e).f64 */
+            if (vn == 5 && (insn & 0x2F)) return false;
+            u8 *slow1 = emit_fp_mode_check();
+            sd_rbx(0x10, 0, OFF_D(dd));
+            if (vn == 4) sd_rbx(0x10, 1, OFF_D(dm)); else xorps_rr(1, 1);
+            ucomisd_rr(0, 1);
+            emit_cmp_to_fpscr();
+            u8 *done = jmp32();
+            emit_fp_slow(slow1, NULL, done, pc, insn);
+            return true;
+        }
+        return false;
+    }
+    if (!dbl) return false;                                         /* f32 arithmetic: emit_vfp */
+    u32 L = b6;
+    if (vop == 1 || vop > 4 || (vop == 4 && L)) return false;
+    u8 *slow1 = emit_fp_mode_check();
+    sd_rbx(0x10, 0, OFF_D(dn));
+    switch (vop) {
+    case 3: sd_rbx(L ? 0x5C : 0x58, 0, OFF_D(dm)); break;
+    case 2: sd_rbx(0x59, 0, OFF_D(dm)); break;
+    case 4: sd_rbx(0x5E, 0, OFF_D(dm)); break;
+    default:
+        sd_rbx(0x59, 0, OFF_D(dm));
+        if (!L) sd_rbx(0x58, 0, OFF_D(dd));
+        else { sd_rbx(0x10, 1, OFF_D(dd)); e8(0xF2); e8(0x0F); e8(0x5C); e8(0xC8); e8(0xF2); e8(0x0F); e8(0x10); e8(0xC1); }
+        break;
+    }
+    ucomisd_rr(0, 0);
+    u8 *slow2 = jcc32(0xA);
+    if (vop == 2 && L) {
+        e8(0x66); e8(0x48); e8(0x0F); e8(0x7E); e8(0xC0);           /* movq rax, xmm0 */
+        mov_ri64(RDX, 0x8000000000000000ULL);
+        { static const u8 o[] = { 0x31 }; mrm_rr(1, o, 1, RDX, RAX, false); }
+        st64_rbx(RAX, OFF_D(dd));
+    } else sd_rbx(0x11, 0, OFF_D(dd));
+    u8 *done = jmp32();
+    emit_fp_slow(slow1, slow2, done, pc, insn);
+    return true;
+}
+
+/* selftest: would emit_arm7 / emit_vfp2 translate this (generic-decoded) word natively? */
+#define TBASE_DUMMY 0x50000000u
+bool jit_arm7_covers(u32 insn)
+{
+    static u8 scratch[4096];
+    u8 *save = p;
+    p = scratch;
+    u32 cls = (insn >> 25) & 7;
+    bool ok = emit_arm7(insn) || ((cls == 6 || cls == 7) && emit_vfp2(insn, TBASE_DUMMY));
+    p = save;
+    return ok;
+}
+
+/* selftest: would emit_neon translate this word natively? */
+bool jit_neon_covers(u32 insn)
+{
+    static u8 scratch[4096];
+    u8 *save = p;
+    p = scratch;
+    bool ok = emit_neon(insn);
+    p = save;
+    return ok;
+}
+
 static int g_flag_ignore_abi = -1;
 static bool g_fuse_force_live;               /* selftest: always materialize flags */
 static int g_fused_extra;                    /* instructions consumed beyond the current one */           /* RR2_JIT_SAFEFLAGS=1: never assume calls/returns kill flags */
@@ -783,6 +1216,7 @@ static bool emit_insn(u32 pc, u32 insn, bool *ended)
     *ended = false;
     u32 cond = insn >> 28, cls = (insn >> 25) & 7;
     if (cond == 0xF) {
+        if (emit_neon(insn)) return false;
         di_t d; cpu_decode_one(&d, pc, insn);
         if (g_fb_di) d = *g_fb_di;
         if (d.op == OP_nop) return false;
@@ -863,9 +1297,10 @@ static bool emit_insn(u32 pc, u32 insn, bool *ended)
     }
 
     {
-        bool ok = false;
+        bool ok = emit_arm7(insn) || ((cls == 6 || cls == 7) && emit_vfp2(insn, pc));
         u32 b74 = (insn >> 4) & 0xF;
-        if (cls <= 1) {
+        if (ok) {
+        } else if (cls <= 1) {
             bool misc = !(insn & (1u << 25)) && ((b74 & 9) == 9 || ((insn >> 20) & 0x19) == 0x10);
             if (cls == 0 && b74 == 9 && ((insn >> 22) & 0x3F) == 0) ok = emit_mul(insn);
             else if (cls == 0 && b74 == 9 && ((insn >> 23) & 0x1F) == 1) ok = emit_mull(insn);
@@ -988,6 +1423,8 @@ static void *compile_block_thumb(u32 pc0, int max_insns)
         if (pc - G.text_lo >= G.text_span) break;
         di_t d;
         thumb_decode(&d, pc);
+        bool mx = d.insn && neon_needs_mx(d.insn);
+        if (mx != g_mx_on) mx_emit(mx);
         u32 next = pc + d.len;
         g_next = next; g_fb_di = &d; g_ovr = false;
         n++;
@@ -1060,13 +1497,15 @@ static void *compile_block_thumb(u32 pc0, int max_insns)
                 if (emit_insn(pc, w, &ended)) ended = true;
             } else {
                 if (conditional) skip = emit_cond_skip(d.cond);
-                emit_call_handler(NULL, pc, &d);
-                if (thumb_is_branchy(op) || (w >> 28) == 0xF) {
-                    ld_r(RAX, OFF_R(15));
-                    alu_ri(7, RAX, next);
-                    u8 *same = jcc32(CC_E);
-                    emit_exit_indirect();
-                    patch32(same, p);
+                if ((w >> 28) != 0xF || !emit_neon(w)) {
+                    emit_call_handler(NULL, pc, &d);
+                    if (thumb_is_branchy(op) || (w >> 28) == 0xF) {
+                        ld_r(RAX, OFF_R(15));
+                        alu_ri(7, RAX, next);
+                        u8 *same = jcc32(CC_E);
+                        emit_exit_indirect();
+                        patch32(same, p);
+                    }
                 }
                 if (skip) patch32(skip, p);
             }
@@ -1075,6 +1514,7 @@ static void *compile_block_thumb(u32 pc0, int max_insns)
         }
         pc = next;
     }
+    if (g_mx_on) mx_emit(0);
     if (!ended) emit_exit_direct(pc);
     g_tmode = false; g_fb_di = NULL;
     flush_slots();
@@ -1098,6 +1538,7 @@ static void *compile_block(u32 pc0, int max_insns)
     while (n < max_insns) {
         if (pc - G.text_lo >= G.text_span) break;
         u32 insn = ld32(pc);
+        if (neon_needs_mx(insn) != g_mx_on) mx_emit(!g_mx_on);
         g_next = pc + 4;
         n++;
         if (max_insns == 1 && ((insn >> 25) & 7) <= 1 && (insn >> 28) == 0xE) {
@@ -1109,6 +1550,7 @@ static void *compile_block(u32 pc0, int max_insns)
         } else if (emit_insn(pc, insn, &ended)) break;
         pc += 4;
     }
+    if (g_mx_on) mx_emit(0);
     if (!ended) emit_exit_direct(pc);            /* ran off the end: continue at the next pc */
     flush_slots();
     n += g_fused_extra;
@@ -1125,6 +1567,7 @@ static void *compile_block(u32 pc0, int max_insns)
 static bool jit_init(void)
 {
     if (jc_base) return true;
+    g_mx[0] = _mm_getcsr(); g_mx[1] = g_mx[0] | 0x8040;           /* FTZ | DAZ */
     jc_base = mmap(NULL, JIT_CACHE, PROT_READ | PROT_WRITE | PROT_EXEC,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (jc_base == MAP_FAILED) { jc_base = NULL; return false; }

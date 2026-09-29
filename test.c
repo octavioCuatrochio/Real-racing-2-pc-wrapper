@@ -582,12 +582,13 @@ static void test_scanf(cpu_t *c)
 static u32 fz_seed = 0x1234567;
 static u32 fz(void) { fz_seed ^= fz_seed << 13; fz_seed ^= fz_seed >> 17; fz_seed ^= fz_seed << 5; return fz_seed; }
 
+bool jit_arm7_covers(u32 insn);
 static void test_fuzz_fast(cpu_t *c)
 {
     enum { MEM = 0x3000 };
     static u8 mem0[MEM], mem1[MEM];
     const u32 pc = TBASE + 0x100;
-    int tested = 0, bad = 0, jtested = 0, jbad = 0;
+    int tested = 0, bad = 0, jtested = 0, jbad = 0, gtested = 0;
     for (int it = 0; it < 600000 && bad < 8 && jbad < 8; it++) {
         u32 kind = fz() % 5, cond = (fz() & 3) ? 0xE : fz() % 15;
         u32 insn = cond << 28;
@@ -597,7 +598,8 @@ static void test_fuzz_fast(cpu_t *c)
         else if (kind == 3) insn |= 0x90u | (fz() & 0x003FFF0Fu);          /* mul/mla */
         else insn |= ((fz() & 1) ? 0x0C000000u : 0x0E000000u) | (fz() & 0x01FFF0FFu) | ((10u + (fz() & 1)) << 8);  /* vfp */
         di_t d;
-        if (!cpu_decode_one(&d, pc, insn)) continue;
+        bool fastok = cpu_decode_one(&d, pc, insn);
+        if (!fastok && !jit_arm7_covers(insn)) continue;
         if ((insn & 0x0FFFFFF0u) == 0x012FFF10u) continue;               /* bx: needs even target */
         if (kind < 2 && ((insn >> 12) & 0xF) == 15) continue;            /* writes pc: random target */
         bool memop = kind == 1 || kind == 2 || (kind == 4 && ((insn >> 25) & 7) == 6) ||
@@ -611,8 +613,8 @@ static void test_fuzz_fast(cpu_t *c)
         }
         if (kind == 1 && (insn & (1u << 25)) && (insn & 0xF) == ((insn >> 16) & 0xF)) continue;
         for (int i = 0; i < MEM; i++) mem0[i] = (u8)fz();
-        static u32 v0[32], vg[32];
-        for (int i = 0; i < 32; i++) {                       /* mix of sane floats and raw bits */
+        static u32 v0[64], vg[64];
+        for (int i = 0; i < 64; i++) {                       /* mix of sane floats and raw bits */
             f32 f = (f32)((s32)fz() % 20000) / 64.0f;
             memcpy(&v0[i], &f, 4);
             if (!(fz() & 7)) v0[i] = fz();
@@ -630,12 +632,14 @@ static void test_fuzz_fast(cpu_t *c)
         memcpy(c->r, r0, sizeof(r0)); c->cpsr = cpsr0; c->r[15] = pc + 4;
         memcpy(c->v.w, v0, sizeof(v0)); c->fpscr = fpscr0;
         memcpy(g2h(TDATA), mem0, MEM);
-        if (d.cond == 0xE || ((cond_tab[d.cond] >> (c->cpsr >> 28)) & 1)) d.h(c, &d);
-        memcpy(rf, c->r, sizeof(rf)); ff = c->cpsr;
-
-        tested++;
-        bool fast_bad = memcmp(rg, rf, sizeof(rg)) || fg != ff || memcmp(mem1, g2h(TDATA), MEM) ||
-                        memcmp(vg, c->v.w, sizeof(vg)) || fpg != c->fpscr;
+        bool fast_bad = false;
+        if (fastok) {
+            if (d.cond == 0xE || ((cond_tab[d.cond] >> (c->cpsr >> 28)) & 1)) d.h(c, &d);
+            memcpy(rf, c->r, sizeof(rf)); ff = c->cpsr;
+            tested++;
+            fast_bad = memcmp(rg, rf, sizeof(rg)) || fg != ff || memcmp(mem1, g2h(TDATA), MEM) ||
+                       memcmp(vg, c->v.w, sizeof(vg)) || fpg != c->fpscr;
+        } else gtested++;
 
         /* third run: the JIT, one instruction compiled as its own block */
         memcpy(c->r, r0, sizeof(r0)); c->cpsr = cpsr0;
@@ -651,7 +655,7 @@ static void test_fuzz_fast(cpu_t *c)
                 if (jbad <= 8) {
                     LOG("JIT mismatch insn %08x: cpsr %08x vs %08x", insn, fg, c->cpsr);
                     for (int i = 0; i < 15; i++) if (rg[i] != rj[i]) LOG(" r%d %08x vs %08x", i, rg[i], rj[i]);
-                    for (int i = 0; i < 32; i++) if (vg[i] != c->v.w[i]) LOG(" s%d %08x vs %08x", i, vg[i], c->v.w[i]);
+                    for (int i = 0; i < 64; i++) if (vg[i] != c->v.w[i]) LOG(" s%d %08x vs %08x", i, vg[i], c->v.w[i]);
                     LOG("%s\n", memcmp(mem1, g2h(TDATA), MEM) ? " (memory differs)" : "");
                 }
             }
@@ -660,12 +664,12 @@ static void test_fuzz_fast(cpu_t *c)
             bad++;
             LOG("FUZZ mismatch insn %08x: cpsr %08x vs %08x", insn, fg, ff);
             for (int i = 0; i < 16; i++) if (rg[i] != rf[i]) LOG(" r%d %08x vs %08x", i, rg[i], rf[i]);
-            for (int i = 0; i < 32; i++) if (vg[i] != c->v.w[i]) LOG(" s%d %08x vs %08x", i, vg[i], c->v.w[i]);
+            for (int i = 0; i < 64; i++) if (vg[i] != c->v.w[i]) LOG(" s%d %08x vs %08x", i, vg[i], c->v.w[i]);
             if (fpg != c->fpscr) LOG(" fpscr %08x vs %08x", fpg, c->fpscr);
             LOG("%s\n", memcmp(mem1, g2h(TDATA), MEM) ? " (memory differs)" : "");
         }
     }
-    LOG("[selftest] fuzz: %d fast-path, %d JIT instructions compared\n", tested, jtested);
+    LOG("[selftest] fuzz: %d fast-path, %d JIT instructions compared (%d generic-decoded)\n", tested, jtested, gtested);
     CHECK(bad == 0 && tested > 100000);
     CHECK(jbad == 0 && jtested > 100000);
 }
@@ -777,6 +781,78 @@ static void test_fuzz_fused(cpu_t *c)
     CHECK(bad == 0 && tested > 50000);
 }
 
+
+/* JIT NEON translations vs the reference (neon_dp / neon_ls), full D register file */
+bool jit_neon_covers(u32 insn);
+bool jit_arm7_covers(u32 insn);
+void neon_dp(cpu_t *c, u32 insn);
+void neon_ls(cpu_t *c, u32 insn);
+static u32 fz_float(void)
+{
+    switch (fz() % 10) {
+    case 0: return 0;
+    case 1: return 0x80000000u;
+    case 2: return fz() & 0x807FFFFFu;                          /* denormal */
+    case 3: return (fz() & 0x80000000u) | 0x7F800000u;          /* inf */
+    case 4: return 0x7F800000u | (fz() & 0x807FFFFFu) | 1;      /* nan */
+    case 5: return fz();
+    case 6: return (fz() & 0x80FFFFFFu) | 0x00800000u;          /* tiny normals */
+    default: { f32 f = (f32)((s32)fz() % 20000) / 64.0f; u32 b; memcpy(&b, &f, 4); return b; }
+    }
+}
+static void test_fuzz_neon_jit(cpu_t *c)
+{
+    const u32 pc = TBASE + 0x800;
+    enum { MEMN = 512 };
+    static u8 mem0[MEMN], memr[MEMN];
+    int tested = 0, bad = 0;
+    for (int iter = 0; iter < 300000; iter++) {
+        u32 regs3 = fz() & 0x004FF0AFu, insn;
+        switch (fz() % 7) {
+        case 0: insn = 0xF2000D00u | (fz() & 1) << 24 | (fz() & 1) << 21 | (fz() & 1) << 6 | (fz() & 1) << 4 | regs3; break;
+        case 1: { static const u32 A[3] = { 1, 5, 9 };
+                  insn = 0xF2A00040u | (fz() & 1) << 24 | A[fz() % 3] << 8 | (fz() & 0x004FF02Fu); break; }
+        case 2: insn = 0xF2000110u | (fz() & 1) << 24 | (fz() & 3) << 20 | (fz() & 1) << 6 | regs3; break;
+        case 3: insn = 0xF2800010u | (fz() & 0x01470F6Fu); break;
+        default: insn = 0xF4000000u | (fz() & 0x00EFFFFFu); break;
+        }
+        if (!jit_neon_covers(insn)) continue;
+        u32 r0[16], v0[64], vr[64], rr[16];
+        for (int i = 0; i < 15; i++) r0[i] = fz() & 0x3F;
+        if ((insn >> 24) == 0xF4) {
+            u32 rn = (insn >> 16) & 0xF;
+            r0[rn] = TDATA + 0x80 + (fz() & 0xFF);
+        }
+        for (int i = 0; i < 64; i++) v0[i] = fz_float();
+        for (int i = 0; i < MEMN; i++) mem0[i] = (u8)fz();
+        u32 fpscr0 = fz() & 0xF0000000u;
+
+        memcpy(c->r, r0, sizeof(r0)); c->r[15] = pc + 8; c->cpsr = 0;
+        memcpy(c->v.w, v0, sizeof(v0)); c->fpscr = fpscr0;
+        memcpy(g2h(TDATA), mem0, MEMN);
+        if ((insn >> 24) == 0xF4) neon_ls(c, insn); else neon_dp(c, insn);
+        memcpy(rr, c->r, sizeof(rr)); memcpy(vr, c->v.w, sizeof(vr)); memcpy(memr, g2h(TDATA), MEMN);
+        u32 fr = c->fpscr;
+
+        memcpy(c->r, r0, sizeof(r0)); c->cpsr = 0;
+        memcpy(c->v.w, v0, sizeof(v0)); c->fpscr = fpscr0;
+        memcpy(g2h(TDATA), mem0, MEMN);
+        if (!jit_test_one(c, pc, insn)) continue;
+        tested++;
+        if (memcmp(rr, c->r, 15 * 4) || memcmp(vr, c->v.w, sizeof(vr)) || memcmp(memr, g2h(TDATA), MEMN) || fr != c->fpscr) {
+            if (++bad <= 10) {
+                LOG("NEON JIT mismatch %08x:", insn);
+                for (int i = 0; i < 15; i++) if (rr[i] != c->r[i]) LOG(" r%d %08x vs %08x", i, rr[i], c->r[i]);
+                for (int i = 0; i < 64; i++) if (vr[i] != c->v.w[i]) LOG(" s%d %08x vs %08x (in %08x)", i, vr[i], c->v.w[i], v0[i]);
+                if (fr != c->fpscr) LOG(" fpscr %08x vs %08x", fr, c->fpscr);
+                LOG("%s\n", memcmp(memr, g2h(TDATA), MEMN) ? " (memory differs)" : "");
+            }
+        }
+    }
+    LOG("[selftest] neon jit: %d compared, %d mismatches\n", tested, bad);
+    CHECK(bad == 0 && tested > 50000);
+}
+
 int selftest_main(void)
 {
     cpu_t *c = emu_new_cpu();
@@ -801,6 +877,7 @@ int selftest_main(void)
     cpu_icache_reset();
     test_fuzz_fast(c);
     test_fuzz_fused(c);
+    test_fuzz_neon_jit(c);
 
     LOG("[selftest] %d passed, %d failed\n", passes, fails);
     return fails ? 1 : 0;

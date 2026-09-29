@@ -61,7 +61,8 @@ static void on_prof(int sig, siginfo_t *si, void *ucv)
     for (u32 k = 0; k < PROF_N; k++, h = (h + 1) & (PROF_N - 1))
         if (g_prof[h].key == key || !g_prof[h].key) { g_prof[h].key = key; g_prof[h].n++; return; }
 }
-static void prof_start(void)
+int g_do_prof;
+void prof_start(void)
 {
     struct sigaction sa = { .sa_sigaction = on_prof, .sa_flags = SA_SIGINFO | SA_RESTART };
     sigaction(SIGPROF, &sa, NULL);
@@ -72,7 +73,7 @@ static void prof_start(void)
     struct itimerspec it = { { 0, 500000 }, { 0, 500000 } };   /* every 0.5 ms of CPU */
     timer_settime(t, 0, &it, NULL);
 }
-static void prof_report(void)
+void prof_report(void)
 {
     /* fold host samples to their symbol / library */
     static struct { char name[96]; u32 n; } agg[512];
@@ -116,8 +117,9 @@ static void prof_report(void)
 }
 
 #else
-static void prof_start(void) { LOG("[prof] --prof is only available on Linux\n"); }
-static void prof_report(void) {}
+int g_do_prof;
+void prof_start(void) { LOG("[prof] --prof is only available on Linux\n"); }
+void prof_report(void) {}
 #endif
 
 /* a host memory fault: 1 = a watchpoint hit (retry the access), 0 = a crash (reported) */
@@ -386,7 +388,7 @@ int main(int argc, char **argv)
         }
         if (G.headless) LOG("[boot] no host GL: continuing headless\n");
     }
-    if (G.game == 3 || strstr(so_path, "RealRacing3")) return rr3_main(so_path);
+    if (G.game == 3 || strstr(so_path, "RealRacing3")) { g_do_prof = do_prof; return rr3_main(so_path); }
     LOG("[boot] loading %s\n", so_path);
     if (elf_load(&G, so_path) != 0)
         fatal("failed to load %s", so_path);

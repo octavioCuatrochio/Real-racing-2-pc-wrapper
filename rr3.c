@@ -160,11 +160,33 @@ int rr3_main(const char *so_path)
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     u64 i0 = c->insn_count;
-    long frames = 0;
+    long frames = 0, prof_frame = 0;
+    /* timed scripting: RR2_T_PROF / RR2_T_STOP seconds, RR2_T_SHOT png at stop, RR2_TAPS "sec:x,y;..." */
+    double t_prof = getenv("RR2_T_PROF") ? atof(getenv("RR2_T_PROF")) : g_do_prof ? 0 : -1;
+    double t_stop = getenv("RR2_T_STOP") ? atof(getenv("RR2_T_STOP")) : 0;
+    const char *taps = getenv("RR2_TAPS");
+    struct timespec tb;
+    clock_gettime(CLOCK_MONOTONIC, &tb);
     for (; render && (!G.max_frames || frames < G.max_frames); frames++) {
         g_frame = frames;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double now = (t1.tv_sec - tb.tv_sec) + (t1.tv_nsec - tb.tv_nsec) / 1e9;
+        if (g_do_prof && t_prof >= 0 && now >= t_prof) { prof_start(); prof_frame = frames; t_prof = -1; }
+        bool stop = t_stop && now >= t_stop;
+        while (taps && *taps) {
+            double at; int x, y, nch = 0;
+            if (sscanf(taps, "%lf:%d,%d%n", &at, &x, &y, &nch) != 3) { taps = NULL; break; }
+            if (now < at) break;
+            LOG("[rr3] tap %d,%d at %.1fs\n", x, y, now);
+            on_touch3(0, x, y); on_touch3(1, x, y);
+            taps += nch; if (*taps == ';') taps++;
+        }
         rr3_input(c);
         jcall(c, render, 2, ra);
+        if (stop) {
+            if (getenv("RR2_T_SHOT")) glhost_screenshot(getenv("RR2_T_SHOT"), G.width, G.height);
+            break;
+        }
         extern void frame_screenshots(long frame);
         frame_screenshots(frames);
         if (!host_present()) break;
@@ -175,6 +197,7 @@ int rr3_main(const char *so_path)
             t0 = t1; i0 = c->insn_count;
         }
     }
+    if (g_do_prof) { prof_report(); glhost_report(frames - prof_frame); }
     LOG("[rr3] onPauseJNI / onStopJNI\n");
     jcall(c, fn("Java_com_firemint_realracing_MainActivity_onPauseJNI"), 0, NULL);
     jcall(c, fn("Java_com_firemint_realracing_MainActivity_onStopJNI"), 0, NULL);
